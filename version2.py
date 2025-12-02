@@ -124,7 +124,7 @@ class OptimizeResponse(BaseModel):
 app = FastAPI(title="Portfolio Optimizer API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock this down in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
