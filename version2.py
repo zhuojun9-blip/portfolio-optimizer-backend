@@ -1,6 +1,6 @@
 # backend/app.py
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Literal, Optional, Dict, Any
 
 import numpy as np
@@ -9,7 +9,7 @@ import yfinance as yf
 import statsmodels.api as sm
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---- Optional: SciPy for constrained optimization ----
@@ -18,6 +18,27 @@ try:
     _HAVE_SCIPY = True
 except Exception:
     _HAVE_SCIPY = False
+
+
+def utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def bounded_close(symbol: str, start: date, end: date) -> pd.Series:
+    """Download and enforce [start, end) using the exchange-local calendar date."""
+    history = yf.Ticker(symbol).history(
+        start=start.isoformat(), end=end.isoformat(), auto_adjust=True
+    )
+    close = history.get("Close", pd.Series(dtype=float)).copy()
+    if close.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    index = pd.DatetimeIndex(close.index)
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    close.index = index.normalize()
+    close = close.sort_index()
+    close = close.loc[~close.index.duplicated(keep="last")]
+    return close.loc[(close.index >= pd.Timestamp(start)) & (close.index < pd.Timestamp(end))]
 
 
 # ----------------- helpers from your script -----------------
@@ -111,8 +132,19 @@ class OptimizeRequest(BaseModel):
     targetReturn: Optional[float] = None            # decimal, e.g. 0.12 for 12%
     allowShort: bool = False
     historyYears: int = Field(default=5, gt=0)
-    # Calendar days ending before today (UTC); takes precedence over historyYears.
+    # Calendar days ending before asOfDate; takes precedence over historyYears.
     historyDays: Optional[int] = Field(default=None, gt=0, strict=True)
+    asOfDate: Optional[date] = Field(
+        default=None,
+        description="Exclusive end date (YYYY-MM-DD); defaults to today in UTC.",
+    )
+
+    @field_validator("asOfDate")
+    @classmethod
+    def validate_as_of_date(cls, value):
+        if value is not None and value > utc_today():
+            raise ValueError("asOfDate cannot be in the future")
+        return value
 
 class OptimizeResponse(BaseModel):
     market: Dict[str, float]
@@ -140,18 +172,33 @@ def optimize(req: OptimizeRequest):
     years = req.historyYears
     period = f"{years}y"
 
-    history_kwargs = {"period": period}
-    if req.historyDays is not None:
-        end = datetime.now(timezone.utc).date()
-        start = end - timedelta(days=req.historyDays)
-        history_kwargs = {"start": start.isoformat(), "end": end.isoformat()}
+    bounded = req.historyDays is not None or req.asOfDate is not None
+    end = req.asOfDate or utc_today()
+    if end > utc_today():
+        raise HTTPException(status_code=422, detail="asOfDate cannot be in the future")
+    if bounded:
+        try:
+            start = (
+                end - timedelta(days=req.historyDays)
+                if req.historyDays is not None
+                else (pd.Timestamp(end) - pd.DateOffset(years=years)).date()
+            )
+            rate_start = end - timedelta(days=31)
+        except (OverflowError, ValueError):
+            raise HTTPException(status_code=422, detail="Requested lookback is outside the supported date range.")
+
+    def get_close(symbol):
+        if bounded:
+            return bounded_close(symbol, start, end)
+        return yf.Ticker(symbol).history(period=period)["Close"]
 
     # Market (Rm) & Risk-free (Rf)
-    sp500 = yf.Ticker("^GSPC").history(**history_kwargs)["Close"]
-    if req.historyDays is not None:
+    sp500 = get_close("^GSPC")
+    if bounded:
         market_returns = sp500.pct_change(fill_method=None).dropna()
         if len(market_returns) < 2 or not np.isfinite(market_returns).all() or market_returns.var() <= 0:
             raise HTTPException(status_code=422, detail="Window needs at least two finite, varying market returns.")
+    if req.historyDays is not None:
         # Arithmetic annual expected return, not realized CAGR.
         Rm = float(market_returns.mean() * 252)
     else:
@@ -159,8 +206,20 @@ def optimize(req: OptimizeRequest):
         annual_returns = sp_year.pct_change().dropna()
         Rm = float(annual_returns.mean())
 
-    tnx = yf.Ticker("^TNX").history(period="1mo")["Close"]
-    Rf = float(tnx.iloc[-1] / 100.0)  # decimal
+    if not np.isfinite(Rm):
+        raise HTTPException(status_code=422, detail="Insufficient market history to estimate annual return.")
+
+    if bounded:
+        tnx = bounded_close("^TNX", rate_start, end).dropna()
+        tnx = tnx.loc[np.isfinite(tnx)]
+        if tnx.empty:
+            raise HTTPException(
+                status_code=422,
+                detail="No valid Treasury yield in the 31 calendar days before asOfDate.",
+            )
+    else:
+        tnx = yf.Ticker("^TNX").history(period="1mo")["Close"]
+    Rf = float(tnx.iloc[-1] / 100.0)  # Latest available before the exclusive cutoff.
 
     # Per-stock: CAPM expected returns + daily returns for covariance
     per_stock: Dict[str, Dict[str, float]] = {}
@@ -170,11 +229,11 @@ def optimize(req: OptimizeRequest):
     market_full_close = sp500
 
     for ticker in req.tickers:
-        hist_close = yf.Ticker(ticker).history(**history_kwargs)["Close"]
+        hist_close = get_close(ticker)
         # aligned returns
         returns = build_returns_aligned(hist_close, market_full_close)
 
-        if req.historyDays is not None and (
+        if bounded and (
             len(returns) < 2 or not np.isfinite(returns.to_numpy()).all()
             or returns["market"].var() <= 0
         ):
@@ -203,7 +262,7 @@ def optimize(req: OptimizeRequest):
         cagr = float("nan")
         if len(prices) > 1:
             years_span = max(1, (prices.index[-1].year - prices.index[0].year))
-            if req.historyDays is not None:
+            if bounded:
                 years_span = (prices.index[-1] - prices.index[0]).total_seconds() / (365.25 * 86400)
             if prices.iloc[0] > 0 and years_span > 0:
                 cagr = float((prices.iloc[-1] / prices.iloc[0]) ** (1 / years_span) - 1)
@@ -222,7 +281,7 @@ def optimize(req: OptimizeRequest):
         )
 
     stock_returns_df = pd.concat(daily_returns_matrix, axis=1, join="inner").dropna()
-    if req.historyDays is not None and len(stock_returns_df) < 2:
+    if bounded and len(stock_returns_df) < 2:
         raise HTTPException(status_code=422, detail="Window needs at least two common daily returns across stocks.")
     used_tickers = list(stock_returns_df.columns)
 
