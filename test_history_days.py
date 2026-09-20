@@ -22,7 +22,8 @@ class HistoryDaysTests(unittest.TestCase):
                 def history(self, **kwargs):
                     calls.append((symbol, kwargs))
                     if symbol == "^TNX":
-                        return pd.DataFrame({"Close": [4.0]}, index=pd.to_datetime(["2025-01-01"]))
+                        rate_date = pd.Timestamp(kwargs["end"]) - pd.Timedelta(days=1) if "end" in kwargs else pd.Timestamp("2025-01-01")
+                        return pd.DataFrame({"Close": [4.0]}, index=pd.DatetimeIndex([rate_date]))
                     if "start" in kwargs:
                         idx = pd.bdate_range(kwargs["start"], kwargs["end"], inclusive="left")[:rows]
                     else:
