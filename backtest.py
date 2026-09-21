@@ -14,6 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from scipy.optimize import minimize
 
 
+BACKTEST_MARKETS = {
+    "US": {"benchmark": "^GSPC", "currency": "USD"},
+    "HK": {"benchmark": "^HSI", "currency": "HKD"},
+    "CN_SH": {"benchmark": "000001.SS", "currency": "CNY"},
+    "CN_SZ": {"benchmark": "399001.SZ", "currency": "CNY"},
+}
+
+
 class BacktestError(ValueError):
     pass
 
@@ -21,6 +29,7 @@ class BacktestError(ValueError):
 class BacktestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tickers: list[str] = Field(min_length=2, max_length=20)
+    market: Literal["US", "HK", "CN_SH", "CN_SZ"] = "US"
     startDate: date  # Earliest execution date, inclusive.
     endDate: date  # Final valuation date, inclusive.
     mode: Literal["single", "rolling"] = "single"
@@ -31,6 +40,7 @@ class BacktestRequest(BaseModel):
     initialCapital: float = Field(default=100000, gt=0, le=1e12, allow_inf_nan=False)
     targetReturn: float | None = Field(default=None, ge=-1, le=10, allow_inf_nan=False)
     # None means target the equal-weight expected return in each training window.
+    userWeights: dict[str, float] | None = None
 
     @field_validator("tickers")
     @classmethod
@@ -39,12 +49,20 @@ class BacktestRequest(BaseModel):
         values = [v.strip().upper() for v in values]
         if len(set(values)) != len(values):
             raise ValueError("Duplicate tickers are not allowed")
-        if any(not re.fullmatch(r"[A-Z][A-Z0-9-]{0,14}", v) for v in values):
-            raise ValueError("Use US equity symbols in USD, e.g. AAPL or BRK-B")
         return values
 
     @model_validator(mode="after")
     def validate_dates(self):
+        import re
+        patterns = {
+            "US": (r"[A-Z][A-Z0-9-]{0,14}", "US symbols such as AAPL or BRK-B"),
+            "HK": (r"\d{4}\.HK", "Hong Kong symbols such as 0700.HK"),
+            "CN_SH": (r"\d{6}\.SS", "Shanghai symbols such as 600519.SS"),
+            "CN_SZ": (r"\d{6}\.SZ", "Shenzhen symbols such as 000001.SZ"),
+        }
+        pattern, description = patterns[self.market]
+        if any(not re.fullmatch(pattern, ticker) for ticker in self.tickers):
+            raise ValueError(f"Use {description}")
         if not date(1970, 1, 1) <= self.startDate < self.endDate:
             raise ValueError("Require 1970-01-01 <= startDate < endDate")
         if self.endDate >= datetime.now(timezone.utc).date():
@@ -60,6 +78,15 @@ class BacktestRequest(BaseModel):
                 raise ValueError("Estimation dates must be ordered and end before startDate")
             if (self.estimationEnd - self.estimationStart).days > 7305:
                 raise ValueError("Estimation window is limited to 20 years")
+        if self.userWeights is not None:
+            normalized = {ticker.strip().upper(): weight for ticker, weight in self.userWeights.items()}
+            if set(normalized) != set(self.tickers):
+                raise ValueError("User weights must include each selected ticker exactly once")
+            if any(not np.isfinite(weight) or weight < 0 for weight in normalized.values()):
+                raise ValueError("User weights must be finite and non-negative")
+            if not np.isclose(sum(normalized.values()), 1.0, atol=1e-6):
+                raise ValueError("User weights must sum to 1.0")
+            self.userWeights = normalized
         return self
 
 
@@ -78,7 +105,8 @@ def prepare_data(req, loader):
     """loader(symbol, inclusive_start, exclusive_end) -> adjusted Close Series."""
     begin = req.estimationStart or req.startDate - timedelta(days=req.lookbackDays)
     end = req.endDate + timedelta(days=1)
-    market = clean_series(loader("^GSPC", begin, end))
+    benchmark = BACKTEST_MARKETS[req.market]["benchmark"]
+    market = clean_series(loader(benchmark, begin, end))
     market = market.loc[(market.index >= pd.Timestamp(begin)) & (market.index < pd.Timestamp(end))]
     if market.empty:
         raise BacktestError("No market data in the requested window")
@@ -90,8 +118,13 @@ def prepare_data(req, loader):
     values = np.column_stack([prices.to_numpy(), market.to_numpy()])
     if not np.isfinite(values).all() or (values <= 0).any():
         raise BacktestError("Missing/nonpositive prices on market sessions. No assets or dates were silently removed; choose a window with complete histories.")
-    yields = clean_series(loader("^TNX", begin - timedelta(days=31), end)) / 100
-    yields = yields.loc[np.isfinite(yields)]
+    if req.market == "US":
+        yields = clean_series(loader("^TNX", begin - timedelta(days=31), end)) / 100
+        yields = yields.loc[np.isfinite(yields)]
+    else:
+        # Returns are calculated in local currency; use a zero local cash baseline
+        # until a reliable historical sovereign-yield feed is configured per market.
+        yields = pd.Series(0.0, index=market.index)
     return prices, market, yields
 
 
@@ -195,6 +228,8 @@ def run_backtest(req, prices, market, yields):
         raise BacktestError("Need at least three valuation dates (two realized daily returns)")
     schedule = execution_dates(test.index, req.mode, req.frequency)
     names = ["max_sharpe", "min_variance", "target_return", "equal_weight"]
+    if req.userWeights is not None:
+        names.append("user_holdings")
     states = {s: {"status": "ok", "holdings": None, "nav": [], "weights": [], "rebalances": [], "turnover": 0.} for s in names}
     previous_price = None
     rf_daily = []
@@ -220,21 +255,28 @@ def run_backtest(req, prices, market, yields):
             value = float(state["holdings"].sum()) if pos else req.initialCapital
             if day in schedule:
                 before = state["holdings"] / value if pos else np.zeros(len(p))
-                try:
-                    w, message = solve_weights(strategy, mu, cov, rf, req.targetReturn)
-                except BacktestError as exc:
-                    state.update(status="failed", error=str(exc), failureDate=day.date().isoformat())
-                    # Never report a partial run as comparable full-period performance.
-                    continue
-                turnover = float(np.abs(w - before).sum() / 2) if pos else 0.
-                state["turnover"] += turnover
-                state["holdings"] = value * w
-                state["rebalances"].append({**info, "executionDate": day.date().isoformat(),
-                    "weights": dict(zip(req.tickers, w.tolist())),
-                    "preTradeWeights": dict(zip(req.tickers, before.tolist())),
-                    "turnover": turnover, "solverMessage": message,
-                    "expectedReturn": float(w @ mu), "expectedVolatility": float(np.sqrt(w @ cov @ w)),
-                    "targetReturn": (float(mu.mean()) if req.targetReturn is None else req.targetReturn) if strategy == "target_return" else None})
+                if strategy == "user_holdings" and pos:
+                    pass
+                else:
+                    try:
+                        if strategy == "user_holdings":
+                            w = np.array([req.userWeights[ticker] for ticker in req.tickers], dtype=float)
+                            message = "User-defined buy-and-hold allocation"
+                        else:
+                            w, message = solve_weights(strategy, mu, cov, rf, req.targetReturn)
+                    except BacktestError as exc:
+                        state.update(status="failed", error=str(exc), failureDate=day.date().isoformat())
+                        # Never report a partial run as comparable full-period performance.
+                        continue
+                    turnover = float(np.abs(w - before).sum() / 2) if pos else 0.
+                    state["turnover"] += turnover
+                    state["holdings"] = value * w
+                    state["rebalances"].append({**info, "executionDate": day.date().isoformat(),
+                        "weights": dict(zip(req.tickers, w.tolist())),
+                        "preTradeWeights": dict(zip(req.tickers, before.tolist())),
+                        "turnover": turnover, "solverMessage": message,
+                        "expectedReturn": float(w @ mu), "expectedVolatility": float(np.sqrt(w @ cov @ w)),
+                        "targetReturn": (float(mu.mean()) if req.targetReturn is None else req.targetReturn) if strategy == "target_return" else None})
             state["nav"].append(value)
             state["weights"].append((state["holdings"] / value).tolist())
         previous_price = p.copy()
@@ -251,12 +293,15 @@ def run_backtest(req, prices, market, yields):
         output[strategy] = {"status": "ok", "metrics": metrics, "nav": state["nav"],
             "drawdown": (nav / nav.cummax() - 1).tolist(), "weights": state["weights"], "rebalances": state["rebalances"]}
     # Hash only the data available within the requested run, not injected future rows.
-    snapshot = pd.concat([prices.loc[:str(req.endDate)], market.loc[:str(req.endDate)].rename("^GSPC"),
+    benchmark = BACKTEST_MARKETS[req.market]["benchmark"]
+    snapshot = pd.concat([prices.loc[:str(req.endDate)], market.loc[:str(req.endDate)].rename(benchmark),
                           yields.loc[:str(req.endDate)].rename("rf")], axis=1)
     return {"config": req.model_dump(mode="json"), "dates": dates, "strategies": output,
         "dataSha256": hashlib.sha256(snapshot.to_csv().encode()).hexdigest(),
         "assumptions": ["Zero transaction costs; long-only, fully invested, fractional holdings.",
             "Adjusted-close total-return approximation with dividend reinvestment; no separate dividend credits.",
+            ("Sharpe uses historical US 10-year Treasury yields." if req.market == "US"
+             else "Sharpe uses a 0% local cash baseline; historical local sovereign yields are not yet configured."),
             "Execute at first market close in each calendar period; use only prices before execution day.",
             "S&P 500 price index (^GSPC) market proxy excludes dividends; annual market estimate = mean daily return × 252.",
             "Sharpe uses lagged ^TNX annual yields converted by (1 + yield)^(1/252) - 1; this is a cash-rate proxy, not a realized Treasury return.",

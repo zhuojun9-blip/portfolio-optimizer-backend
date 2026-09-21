@@ -171,7 +171,7 @@ class BacktestTests(unittest.TestCase):
                 raise RuntimeError("provider outage")
 
         with patch.object(backtest_api.yf, "Ticker", FakeTicker):
-            with self.assertRaisesRegex(backtest_api.DataProviderError, "\^GSPC"):
+            with self.assertRaisesRegex(backtest_api.DataProviderError, r"\^GSPC"):
                 backtest_api.download_data(request())
 
     def test_loader_downloads_once_per_symbol(self):
@@ -183,6 +183,47 @@ class BacktestTests(unittest.TestCase):
         data = bt.prepare_data(request(), loader)
         self.assertCountEqual(calls, ['A','B','^GSPC','^TNX'])
         self.assertTrue(data[0].index.equals(data[1].index))
+
+    def test_hong_kong_uses_hang_seng_and_local_cash_baseline(self):
+        req = request(tickers=["0700.HK", "9988.HK"], market="HK")
+        prices, market, _ = sample_data()
+        calls = []
+
+        def loader(symbol, start, end):
+            calls.append(symbol)
+            return {
+                "0700.HK": prices["A"],
+                "9988.HK": prices["B"],
+                "^HSI": market,
+            }[symbol]
+
+        _, loaded_market, rates = bt.prepare_data(req, loader)
+        self.assertCountEqual(calls, ["0700.HK", "9988.HK", "^HSI"])
+        self.assertGreater(len(loaded_market), 0)
+        self.assertTrue(loaded_market.index.isin(market.index).all())
+        self.assertTrue((rates == 0).all())
+
+    def test_mainland_market_ticker_rules(self):
+        req = request(tickers=["600519.SS", "601318.SS"], market="CN_SH")
+        self.assertEqual(req.market, "CN_SH")
+        with self.assertRaises(ValidationError):
+            request(tickers=["AAPL", "601318.SS"], market="CN_SH")
+
+    def test_user_holdings_are_compared_as_buy_and_hold(self):
+        prices, market, rates = sample_data()
+        req = request(userWeights={"A": 0.75, "B": 0.25})
+        output = bt.run_backtest(req, prices, market, rates)
+        holdings = output["strategies"]["user_holdings"]
+        self.assertEqual(holdings["status"], "ok")
+        self.assertEqual(len(holdings["rebalances"]), 1)
+        self.assertEqual(holdings["rebalances"][0]["weights"], {"A": 0.75, "B": 0.25})
+        self.assertNotEqual(holdings["weights"][-1], [0.75, 0.25])
+
+    def test_user_holdings_must_match_selected_tickers(self):
+        with self.assertRaises(ValidationError):
+            request(userWeights={"A": 1.0})
+        with self.assertRaises(ValidationError):
+            request(userWeights={"A": 0.6, "B": 0.3})
 
 
 if __name__ == '__main__':

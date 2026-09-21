@@ -6,7 +6,7 @@ import yfinance as yf
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from backtest import BacktestError, BacktestRequest, prepare_data, run_backtest
+from backtest import BACKTEST_MARKETS, BacktestError, BacktestRequest, prepare_data, run_backtest
 
 router = APIRouter()
 
@@ -27,8 +27,9 @@ def download_data(req):
             raise DataProviderError(f"No historical price data was found for {symbol} in the requested window.")
         if symbol in req.tickers:
             metadata = ticker.get_history_metadata()
-            if metadata.get("currency") != "USD":
-                raise BacktestError(f"{symbol}: this version requires verified USD price data")
+            expected_currency = BACKTEST_MARKETS[req.market]["currency"]
+            if metadata.get("currency") != expected_currency:
+                raise BacktestError(f"{symbol}: requires verified {expected_currency} price data")
         return close
     return prepare_data(req, loader)
 
