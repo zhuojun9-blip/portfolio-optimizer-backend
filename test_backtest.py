@@ -174,6 +174,22 @@ class BacktestTests(unittest.TestCase):
             with self.assertRaisesRegex(backtest_api.DataProviderError, r"\^GSPC"):
                 backtest_api.download_data(request())
 
+    def test_ticker_search_filters_results_by_market(self):
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"quotes": [
+                    {"symbol": "0700.HK", "shortname": "Tencent"},
+                    {"symbol": "TCEHY", "shortname": "Tencent ADR"},
+                ]}
+
+        with patch.object(backtest_api.requests, "get", return_value=Response()):
+            result = backtest_api.ticker_search("Tencent", "HK")
+
+        self.assertEqual(result["matches"], [{"symbol": "0700.HK", "name": "Tencent"}])
+
     def test_loader_downloads_once_per_symbol(self):
         prices, market, rf = sample_data()
         calls = []

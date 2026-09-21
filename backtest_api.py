@@ -1,7 +1,9 @@
 """HTTP integration and historical data adapter for backtesting."""
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -13,6 +15,42 @@ router = APIRouter()
 
 class DataProviderError(RuntimeError):
     pass
+
+
+@router.get("/api/ticker-search")
+def ticker_search(query: str, market: str = "US"):
+    query = query.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="Enter a company name or ticker.")
+    suffixes = {"US": "", "HK": ".HK", "CN_SH": ".SS", "CN_SZ": ".SZ"}
+    if market not in suffixes:
+        raise HTTPException(status_code=422, detail="Unsupported market.")
+    try:
+        response = requests.get(
+            f"https://query1.finance.yahoo.com/v1/finance/search?q={quote(query)}",
+            params={"quotesCount": 20, "newsCount": 0},
+            timeout=10,
+        )
+        response.raise_for_status()
+        quotes = response.json().get("quotes", [])
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Ticker search is temporarily unavailable. Try a ticker symbol instead.") from exc
+
+    suffix = suffixes[market]
+    matches = []
+    for item in quotes:
+        symbol = str(item.get("symbol", "")).upper()
+        if not symbol or (suffix and not symbol.endswith(suffix)):
+            continue
+        if market == "US" and "." in symbol:
+            continue
+        matches.append({
+            "symbol": symbol,
+            "name": item.get("shortname") or item.get("longname") or symbol,
+        })
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"No {market} ticker was found for '{query}'.")
+    return {"matches": matches[:5]}
 
 
 def download_data(req):
