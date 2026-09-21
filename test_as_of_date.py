@@ -14,7 +14,9 @@ class AsOfTests(unittest.TestCase):
     def run_request(self, request=None, poison=False, no_rate=False):
         calls = []
         request = request or {"historyDays": 90, "asOfDate": "2021-01-01"}
-        cutoff = pd.Timestamp(request.get("asOfDate", "2024-03-01"))
+        cutoff = pd.Timestamp(request.get("asOfDate", request.get("endDate", "2024-03-01")))
+        if "endDate" in request:
+            cutoff += pd.Timedelta(days=1)
 
         def ticker(symbol):
             class FakeTicker:
@@ -100,6 +102,16 @@ class AsOfTests(unittest.TestCase):
     def test_days_override_years(self):
         _, calls = self.run_request({"historyDays": 90, "historyYears": 10, "asOfDate": "2021-01-01"})
         self.assertEqual(calls[0][1]["start"], "2020-10-03")
+
+    def test_inclusive_end_date_windows(self):
+        _, calls = self.run_request({"startDate": "2020-10-03", "endDate": "2020-12-31"})
+        for symbol, kwargs in calls:
+            self.assertEqual(kwargs["end"], "2021-01-01")
+            self.assertEqual(kwargs["start"], "2020-12-01" if symbol == "^TNX" else "2020-10-03")
+
+        _, calls = self.run_request({"historyDays": 90, "endDate": "2020-12-31"})
+        self.assertEqual(calls[0][1]["start"], "2020-10-03")
+        self.assertTrue(all(kwargs["end"] == "2021-01-01" for _, kwargs in calls))
 
 
 if __name__ == "__main__":

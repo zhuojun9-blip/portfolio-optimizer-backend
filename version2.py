@@ -1,10 +1,12 @@
 # backend/app.py
 import math
+import os
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Literal, Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 import statsmodels.api as sm
 
@@ -24,6 +26,28 @@ def utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+MARKET_BENCHMARKS = {
+    "US": "^GSPC",
+    "HK": "^HSI",
+    "CN_SH": "000001.SS",
+    "CN_SZ": "399001.SZ",
+    "JP": "^N225",
+    "CA": "^GSPTSE",
+    "UK": "^FTSE",
+    "IN": "^NSEI",
+}
+
+MARKET_COUNTRIES = {
+    "HK": "hong kong",
+    "CN_SH": "china",
+    "CN_SZ": "china",
+    "JP": "japan",
+    "CA": "canada",
+    "UK": "united kingdom",
+    "IN": "india",
+}
+
+
 def bounded_close(symbol: str, start: date, end: date) -> pd.Series:
     """Download and enforce [start, end) using the exchange-local calendar date."""
     history = yf.Ticker(symbol).history(
@@ -39,6 +63,42 @@ def bounded_close(symbol: str, start: date, end: date) -> pd.Series:
     close = close.sort_index()
     close = close.loc[~close.index.duplicated(keep="last")]
     return close.loc[(close.index >= pd.Timestamp(start)) & (close.index < pd.Timestamp(end))]
+
+
+def latest_local_government_yield(market: str) -> float:
+    """Return the latest 10-year government bond yield as a decimal."""
+    api_key = os.getenv("TRADING_ECONOMICS_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Local risk-free-rate data is unavailable. Configure TRADING_ECONOMICS_API_KEY on the server.",
+        )
+
+    country = MARKET_COUNTRIES[market]
+    try:
+        response = requests.get(
+            f"https://api.tradingeconomics.com/markets/bonds/country/{country}",
+            params={"c": api_key},
+            timeout=10,
+        )
+        response.raise_for_status()
+        quotes = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not retrieve the local government yield for {country}: {exc}",
+        )
+
+    for quote in quotes if isinstance(quotes, list) else []:
+        name = str(quote.get("Name", "")).lower()
+        value = quote.get("Last")
+        if "10 year" in name and "government" in name and isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value) / 100.0
+
+    raise HTTPException(
+        status_code=503,
+        detail=f"No current 10-year government yield is available for {country}.",
+    )
 
 
 # ----------------- helpers from your script -----------------
@@ -65,16 +125,47 @@ def portfolio_stats(w: np.ndarray, mu: np.ndarray, Sigma_ann: np.ndarray, rf: fl
     sharpe = (port_ret - rf) / port_vol if port_vol > 0 else float("nan")
     return {"expected_return": port_ret, "volatility": port_vol, "sharpe": sharpe}
 
+def _require_scipy() -> None:
+    if not _HAVE_SCIPY:
+        raise HTTPException(
+            status_code=503,
+            detail="Portfolio optimization is unavailable because SciPy is not installed.",
+        )
+
+def _solver_weights(result, strategy: str) -> np.ndarray:
+    if not result.success:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{strategy} optimization failed: {result.message}",
+        )
+    return np.asarray(result.x, dtype=float)
+
+def feasible_target_return_range(mu: np.ndarray, allow_short: bool) -> tuple[float, float]:
+    _require_scipy()
+    n = len(mu)
+    bounds = [(-1, 1) if allow_short else (0, 1) for _ in range(n)]
+    constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
+    lower = minimize(
+        lambda w: w @ mu,
+        np.ones(n) / n,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+    )
+    upper = minimize(
+        lambda w: -(w @ mu),
+        np.ones(n) / n,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+    )
+    return float(_solver_weights(lower, "Target-return feasibility check") @ mu), float(
+        _solver_weights(upper, "Target-return feasibility check") @ mu
+    )
+
 def optimize_max_sharpe(mu: np.ndarray, Sigma_ann: np.ndarray, rf: float, allow_short: bool) -> np.ndarray:
     n = len(mu)
-    if not _HAVE_SCIPY:
-        risk = np.diag(Sigma_ann).clip(min=1e-12)
-        scores = (mu - rf) / np.sqrt(risk)
-        scores = np.maximum(scores, 0) if not allow_short else scores
-        if np.all(scores == 0):
-            return np.ones(n) / n
-        w = scores / scores.sum()
-        return w
+    _require_scipy()
 
     def neg_sharpe(w):
         r = w @ mu
@@ -86,15 +177,11 @@ def optimize_max_sharpe(mu: np.ndarray, Sigma_ann: np.ndarray, rf: float, allow_
     bounds = [(-1, 1) if allow_short else (0, 1) for _ in range(n)]
     cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
     res = minimize(neg_sharpe, w0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 1000})
-    return (res.x if res.success else w0)
+    return _solver_weights(res, "Maximum-Sharpe")
 
 def optimize_min_variance(mu: np.ndarray, Sigma_ann: np.ndarray, allow_short: bool) -> np.ndarray:
     n = len(mu)
-    if not _HAVE_SCIPY:
-        iv = 1 / np.diag(Sigma_ann).clip(min=1e-12)
-        if not allow_short:
-            iv = np.maximum(iv, 0)
-        return iv / iv.sum()
+    _require_scipy()
 
     def var_obj(w): return w @ Sigma_ann @ w
 
@@ -102,16 +189,21 @@ def optimize_min_variance(mu: np.ndarray, Sigma_ann: np.ndarray, allow_short: bo
     bounds = [(-1, 1) if allow_short else (0, 1) for _ in range(n)]
     cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
     res = minimize(var_obj, w0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 1000})
-    return (res.x if res.success else w0)
+    return _solver_weights(res, "Minimum-variance")
 
 def optimize_target_return(mu: np.ndarray, Sigma_ann: np.ndarray, target_ret: float, allow_short: bool) -> np.ndarray:
     n = len(mu)
-    if not _HAVE_SCIPY:
-        w = np.ones(n) / n
-        up = np.maximum(mu, 0)
-        if up.sum() > 0:
-            w = up / up.sum()
-        return w
+    _require_scipy()
+    minimum_return, maximum_return = feasible_target_return_range(mu, allow_short)
+    tolerance = 1e-8
+    if target_ret < minimum_return - tolerance or target_ret > maximum_return + tolerance:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Target return {target_ret:.2%} is infeasible. "
+                f"Choose a value between {minimum_return:.2%} and {maximum_return:.2%}."
+            ),
+        )
 
     def var_obj(w): return w @ Sigma_ann @ w
 
@@ -122,7 +214,7 @@ def optimize_target_return(mu: np.ndarray, Sigma_ann: np.ndarray, target_ret: fl
         {"type": "eq", "fun": lambda w, mu=mu, t=target_ret: w @ mu - t},
     ]
     res = minimize(var_obj, w0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 1000})
-    return (res.x if res.success else w0)
+    return _solver_weights(res, "Target-return")
 
 
 # ----------------- request/response models -----------------
@@ -131,19 +223,28 @@ class OptimizeRequest(BaseModel):
     mode: Literal["max_sharpe", "min_variance", "target_return"] = "max_sharpe"
     targetReturn: Optional[float] = None            # decimal, e.g. 0.12 for 12%
     allowShort: bool = False
+    market: Literal["US", "HK", "CN_SH", "CN_SZ", "JP", "CA", "UK", "IN"] = "US"
     historyYears: int = Field(default=5, gt=0)
-    # Calendar days ending before asOfDate; takes precedence over historyYears.
+    # Legacy calendar-day window ending before an exclusive asOfDate cutoff.
     historyDays: Optional[int] = Field(default=None, gt=0, strict=True)
     asOfDate: Optional[date] = Field(
         default=None,
         description="Exclusive end date (YYYY-MM-DD); defaults to today in UTC.",
     )
+    startDate: Optional[date] = Field(
+        default=None,
+        description="Inclusive start date (YYYY-MM-DD). Requires endDate.",
+    )
+    endDate: Optional[date] = Field(
+        default=None,
+        description="Inclusive end date (YYYY-MM-DD).",
+    )
 
-    @field_validator("asOfDate")
+    @field_validator("asOfDate", "endDate")
     @classmethod
-    def validate_as_of_date(cls, value):
+    def validate_end_date(cls, value):
         if value is not None and value > utc_today():
-            raise ValueError("asOfDate cannot be in the future")
+            raise ValueError("End date cannot be in the future")
         return value
 
 class OptimizeResponse(BaseModel):
@@ -172,64 +273,94 @@ def optimize(req: OptimizeRequest):
     years = req.historyYears
     period = f"{years}y"
 
-    bounded = req.historyDays is not None or req.asOfDate is not None
-    end = req.asOfDate or utc_today()
-    if end > utc_today():
-        raise HTTPException(status_code=422, detail="asOfDate cannot be in the future")
+    if req.startDate is not None and req.endDate is None:
+        raise HTTPException(status_code=422, detail="Date range requires an end date.")
+    if req.startDate is None and req.endDate is not None and req.historyDays is None:
+        raise HTTPException(status_code=422, detail="End date requires a start date or lookback days.")
+    if req.startDate is not None and req.historyDays is not None:
+        raise HTTPException(status_code=422, detail="Use either a date range or lookback days, not both.")
+    if req.endDate is not None and req.asOfDate is not None:
+        raise HTTPException(status_code=422, detail="Use either endDate or asOfDate, not both.")
+
+    bounded = any((req.historyDays is not None, req.asOfDate is not None, req.startDate is not None))
+    if req.startDate is not None:
+        if req.startDate > req.endDate:
+            raise HTTPException(status_code=422, detail="Start date must be on or before end date.")
+        start = req.startDate
+        end = req.endDate + timedelta(days=1)
+    else:
+        end = (req.endDate + timedelta(days=1)) if req.endDate is not None else (req.asOfDate or utc_today())
+        start = None
     if bounded:
         try:
-            start = (
-                end - timedelta(days=req.historyDays)
-                if req.historyDays is not None
-                else (pd.Timestamp(end) - pd.DateOffset(years=years)).date()
-            )
+            if start is None:
+                start = (
+                    end - timedelta(days=req.historyDays)
+                    if req.historyDays is not None
+                    else (pd.Timestamp(end) - pd.DateOffset(years=years)).date()
+                )
             rate_start = end - timedelta(days=31)
         except (OverflowError, ValueError):
             raise HTTPException(status_code=422, detail="Requested lookback is outside the supported date range.")
 
-    def get_close(symbol):
-        if bounded:
-            return bounded_close(symbol, start, end)
-        return yf.Ticker(symbol).history(period=period)["Close"]
+    def get_close(symbol, label):
+        try:
+            if bounded:
+                close = bounded_close(symbol, start, end)
+            else:
+                history = yf.Ticker(symbol).history(period=period)
+                close = history.get("Close", pd.Series(dtype=float))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Could not retrieve data for {label}: {exc}")
+        if close.dropna().empty:
+            raise HTTPException(
+                status_code=422,
+                detail=f"No price data was found for ticker '{symbol}'. Check the ticker and selected market.",
+            )
+        return close
 
     # Market (Rm) & Risk-free (Rf)
-    sp500 = get_close("^GSPC")
+    benchmark_close = get_close(MARKET_BENCHMARKS[req.market], "the selected market benchmark")
+    stock_closes = {ticker: get_close(ticker, f"ticker '{ticker}'") for ticker in req.tickers}
     if bounded:
-        market_returns = sp500.pct_change(fill_method=None).dropna()
+        market_returns = benchmark_close.pct_change(fill_method=None).dropna()
         if len(market_returns) < 2 or not np.isfinite(market_returns).all() or market_returns.var() <= 0:
             raise HTTPException(status_code=422, detail="Window needs at least two finite, varying market returns.")
-    if req.historyDays is not None:
+    if bounded:
         # Arithmetic annual expected return, not realized CAGR.
         Rm = float(market_returns.mean() * 252)
     else:
-        sp_year = sp500.resample("YE").last()
-        annual_returns = sp_year.pct_change().dropna()
+        benchmark_year = benchmark_close.resample("YE").last()
+        annual_returns = benchmark_year.pct_change().dropna()
         Rm = float(annual_returns.mean())
 
     if not np.isfinite(Rm):
         raise HTTPException(status_code=422, detail="Insufficient market history to estimate annual return.")
 
-    if bounded:
-        tnx = bounded_close("^TNX", rate_start, end).dropna()
-        tnx = tnx.loc[np.isfinite(tnx)]
-        if tnx.empty:
-            raise HTTPException(
-                status_code=422,
-                detail="No valid Treasury yield in the 31 calendar days before asOfDate.",
-            )
+    if req.market == "US":
+        if bounded:
+            tnx = bounded_close("^TNX", rate_start, end).dropna()
+            tnx = tnx.loc[np.isfinite(tnx)]
+            if tnx.empty:
+                raise HTTPException(
+                    status_code=422,
+                    detail="No valid US Treasury yield in the 31 calendar days before the cutoff.",
+                )
+        else:
+            tnx = yf.Ticker("^TNX").history(period="1mo")["Close"]
+        Rf = float(tnx.iloc[-1] / 100.0)
     else:
-        tnx = yf.Ticker("^TNX").history(period="1mo")["Close"]
-    Rf = float(tnx.iloc[-1] / 100.0)  # Latest available before the exclusive cutoff.
+        Rf = latest_local_government_yield(req.market)
 
     # Per-stock: CAPM expected returns + daily returns for covariance
     per_stock: Dict[str, Dict[str, float]] = {}
     daily_returns_matrix = []
     capm_mu: Dict[str, float] = {}
 
-    market_full_close = sp500
+    market_full_close = benchmark_close
 
     for ticker in req.tickers:
-        hist_close = get_close(ticker)
+        hist_close = stock_closes[ticker]
         # aligned returns
         returns = build_returns_aligned(hist_close, market_full_close)
 
