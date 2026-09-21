@@ -1,0 +1,60 @@
+diff --git a/Project/Frontend/src/my-react-app/src/App.js b/Project/Frontend/src/my-react-app/src/App.js
+index fb78291..5c547ab 100644
+--- a/Project/Frontend/src/my-react-app/src/App.js
++++ b/Project/Frontend/src/my-react-app/src/App.js
+@@ -3,6 +3,7 @@ import React from "react";
+ import { BrowserRouter as Router, Routes, Route, Link } from "react-router-dom";
+ import Optimizer from "./Optimizer";
+ import Definitions from "./Definitions";
++import Backtest from "./Backtest";
+ 
+ const navStyle = {
+   display: "flex",
+@@ -36,6 +37,9 @@ export default function App() {
+         <Link to="/definitions" style={linkStyle}>
+           Definitions
+         </Link>
++        <Link to="/backtest" style={linkStyle}>
++          Backtest
++        </Link>
+         <div style={{ marginLeft: "auto", color: "#6b7280", fontSize: 14 }}>
+           Portfolio Optimizer — CAPM + Mean-Variance
+         </div>
+@@ -44,6 +48,7 @@ export default function App() {
+       <Routes>
+         <Route path="/" element={<Optimizer />} />
+         <Route path="/definitions" element={<Definitions />} />
++        <Route path="/backtest" element={<Backtest />} />
+       </Routes>
+     </Router>
+   );
+diff --git a/Project/Frontend/src/my-react-app/src/Backtest.js b/Project/Frontend/src/my-react-app/src/Backtest.js
+new file mode 100644
+--- /dev/null
++++ b/Project/Frontend/src/my-react-app/src/Backtest.js
+@@ -0,0 +1,25 @@
++import React from "react";
++
++// Match the optimizer's configured API host. The dashboard makes same-origin
++// requests to /api/backtest inside its frame, avoiding duplicate UI/API logic.
++const API = process.env.REACT_APP_API_URL || "http://localhost:8000/api/optimize";
++const dashboardURL = new URL("/backtest", new URL(API, window.location.origin)).href;
++
++export default function Backtest() {
++  return (
++    <section aria-label="Portfolio backtesting">
++      <p style={{ padding: "0 16px", color: "#617584", fontSize: 14 }}>
++        Historical, out-of-sample comparisons with zero transaction costs. The
++        backend may take a moment to wake up.{" "}
++        <a href={dashboardURL} target="_blank" rel="noopener noreferrer">
++          Open dashboard in a separate tab
++        </a>
++      </p>
++      <iframe
++        title="Portfolio backtest dashboard"
++        src={dashboardURL}
++        style={{ width: "100%", height: "calc(100vh - 125px)", minHeight: 650, border: 0 }}
++      />
++    </section>
++  );
++}
