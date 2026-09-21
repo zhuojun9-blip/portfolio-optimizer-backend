@@ -330,3 +330,7 @@ def optimize(req: OptimizeRequest):
         stats={k: float(v) for k, v in stats.items()},
         baseline={k: float(v) for k, v in stats_eq.items()},
     )
+
+# Independent research endpoints preserve the existing optimizer API contract.
+from backtest_api import router as backtest_router
+app.include_router(backtest_router)
