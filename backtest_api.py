@@ -11,15 +11,25 @@ from backtest import BacktestError, BacktestRequest, prepare_data, run_backtest
 router = APIRouter()
 
 
+class DataProviderError(RuntimeError):
+    pass
+
+
 def download_data(req):
     def loader(symbol, start, end):
-        ticker = yf.Ticker(symbol)
-        frame = ticker.history(start=start.isoformat(), end=end.isoformat(), auto_adjust=True, raise_errors=True)
+        try:
+            ticker = yf.Ticker(symbol)
+            frame = ticker.history(start=start.isoformat(), end=end.isoformat(), auto_adjust=True, raise_errors=True)
+        except Exception as exc:
+            raise DataProviderError(f"Could not retrieve historical data for {symbol}. Retry later.") from exc
+        close = frame.get("Close", pd.Series(dtype=float, index=pd.DatetimeIndex([]))).dropna()
+        if close.empty:
+            raise DataProviderError(f"No historical price data was found for {symbol} in the requested window.")
         if symbol in req.tickers:
             metadata = ticker.get_history_metadata()
             if metadata.get("currency") != "USD":
                 raise BacktestError(f"{symbol}: this version requires verified USD price data")
-        return frame.get("Close", pd.Series(dtype=float, index=pd.DatetimeIndex([])))
+        return close
     return prepare_data(req, loader)
 
 
@@ -29,6 +39,8 @@ def backtest_endpoint(req: BacktestRequest):
         data = download_data(req)
     except BacktestError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DataProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Historical data provider unavailable. Retry later or use a saved snapshot with the CLI.") from exc
     try:

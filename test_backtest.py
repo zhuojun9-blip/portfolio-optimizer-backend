@@ -162,6 +162,18 @@ class BacktestTests(unittest.TestCase):
             with self.assertRaisesRegex(bt.BacktestError, "requires verified USD"):
                 backtest_api.download_data(request())
 
+    def test_loader_reports_the_symbol_when_provider_fails(self):
+        class FakeTicker:
+            def __init__(self, symbol):
+                self.symbol = symbol
+
+            def history(self, **kwargs):
+                raise RuntimeError("provider outage")
+
+        with patch.object(backtest_api.yf, "Ticker", FakeTicker):
+            with self.assertRaisesRegex(backtest_api.DataProviderError, "\^GSPC"):
+                backtest_api.download_data(request())
+
     def test_loader_downloads_once_per_symbol(self):
         prices, market, rf = sample_data()
         calls = []
