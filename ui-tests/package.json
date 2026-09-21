@@ -1,0 +1,6 @@
+{
+  "name": "portfolio-backtest-ui-tests",
+  "private": true,
+  "scripts": {"test": "node --test dashboard.test.cjs"},
+  "devDependencies": {"jsdom": "30.1.0"}
+}

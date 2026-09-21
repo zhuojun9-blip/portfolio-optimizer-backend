@@ -1,5 +1,5 @@
 # Portfolio Optimizer
-We have developed a portfolio optimizer. The program asks the user to input the intended stocks they want to invest in. We are calculating the expected return of each of their stocks, and giving the optimized suggestion on how to allocate their asset. We see a significant improvement in the annual return and Sharpe ratio with the optimized distribution of assets.
+We have developed a portfolio optimizer. The program asks the user to input the intended stocks they want to invest in. We are calculating the expected return of each of their stocks, and giving the optimized suggestion on how to allocate their asset. The optimizer compares model-implied return and Sharpe ratio against equal weight; these estimates are not evidence of realized outperformance.
 
 -------
 ## Features 
@@ -77,3 +77,12 @@ Modern Portfolio Theory (MPT), balancing the tradeoff between expected return an
 
 
 
+
+
+## Out-of-sample backtesting
+
+Run the backend and open `/backtest` for a single-period or rolling comparison
+against equal weight. Weekly, monthly and quarterly schedules are supported.
+This research version assumes long-only USD holdings and zero transaction costs.
+See [BACKTESTING.md](BACKTESTING.md) for execution assumptions, API inputs,
+metrics, tests, and replayable CSV snapshots. No actual outperformance is claimed.
