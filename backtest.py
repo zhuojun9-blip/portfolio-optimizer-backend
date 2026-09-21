@@ -41,6 +41,7 @@ class BacktestRequest(BaseModel):
     targetReturn: float | None = Field(default=None, ge=-1, le=10, allow_inf_nan=False)
     # None means target the equal-weight expected return in each training window.
     userWeights: dict[str, float] | None = None
+    maxWeight: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
 
     @field_validator("tickers")
     @classmethod
@@ -78,6 +79,8 @@ class BacktestRequest(BaseModel):
                 raise ValueError("Estimation dates must be ordered and end before startDate")
             if (self.estimationEnd - self.estimationStart).days > 7305:
                 raise ValueError("Estimation window is limited to 20 years")
+        if self.maxWeight * len(self.tickers) < 1 - 1e-10:
+            raise ValueError("Maximum weight is infeasible: number of stocks × cap must be at least 100%")
         if self.userWeights is not None:
             normalized = {ticker.strip().upper(): weight for ticker, weight in self.userWeights.items()}
             if set(normalized) != set(self.tickers):
@@ -158,37 +161,103 @@ def estimate_inputs(prices, market, yields, start, cutoff):
         "trainingEnd": hist.index[-1].date().isoformat(),
         "observations": len(returns), "marketExpectedReturn": rm, "riskFreeRate": rf,
         "beta": dict(zip(prices.columns, beta.tolist())),
+        "expectedReturns": dict(zip(prices.columns, mu.tolist())),
+        "annualCovariance": cov.tolist(),
+        "covarianceTickers": list(prices.columns),
     }
 
 
-def solve_weights(strategy, mu, cov, rf, target=None):
-    """Same objectives as the optimizer, with explicit failures and no fallback."""
+def solve_weights(strategy, mu, cov, rf, target=None, max_weight=1.0):
+    """Validate feasible solutions and compare starts; never silently change objectives.
+
+    Positive excess-return Sharpe uses a convex variance minimization in scaled
+    weights. Nonpositive unconstrained Sharpe is maximized at a simplex vertex.
+    With a cap and nonpositive excess returns, use deterministic multistart;
+    this branch is explicitly not a certificate of global optimality.
+    """
+    mu, cov = np.asarray(mu, float), np.asarray(cov, float)
     n = len(mu)
+    if strategy not in {"max_sharpe", "min_variance", "target_return", "equal_weight"}:
+        raise BacktestError("Unknown strategy")
+    if (cov.shape != (n, n) or not np.isfinite(mu).all() or
+            not np.isfinite(cov).all() or not np.isfinite(rf) or
+            not np.isfinite(max_weight) or not 0 < max_weight <= 1 or n * max_weight < 1 - 1e-10):
+        raise BacktestError("Invalid optimization inputs or infeasible weight cap")
+    cov = (cov + cov.T) / 2
+    if np.linalg.eigvalsh(cov).min() < -1e-10:
+        raise BacktestError("Covariance must be positive semidefinite")
     eq = np.ones(n) / n
     if strategy == "equal_weight":
         return eq, "Equal weight"
+
+    def corner(order):
+        w = np.zeros(n)
+        remaining = 1.0
+        for i in order:
+            w[i] = min(max_weight, remaining)
+            remaining -= w[i]
+        return w
+
+    low, high = corner(np.argsort(mu)), corner(np.argsort(-mu))
+    starts = [eq, low, high]
+    starts += [corner(np.roll(np.arange(n), i)) for i in range(n)]
     if strategy == "target_return":
-        target = float(mu.mean()) if target is None else target
-        if target < mu.min() - 1e-8 or target > mu.max() + 1e-8:
-            raise BacktestError(f"Target return {target:.4%} outside feasible range [{mu.min():.4%}, {mu.max():.4%}]")
+        target = float(mu.mean()) if target is None else float(target)
+        lo, hi = float(low @ mu), float(high @ mu)
+        if not np.isfinite(target) or target < lo - 1e-8 or target > hi + 1e-8:
+            raise BacktestError(f"Target return outside feasible capped range [{lo:.4%}, {hi:.4%}]")
+        starts = [eq if hi - lo < 1e-12 else low + (high - low) * ((target - lo) / (hi - lo))]
+
+    def valid(w):
+        return (np.isfinite(w).all() and abs(w.sum() - 1) < 1e-7 and
+                w.min() >= -1e-8 and w.max() <= max_weight + 1e-8 and
+                w @ cov @ w > 1e-16 and
+                (strategy != "target_return" or abs(w @ mu - target) < 1e-7))
+
     def objective(w):
         variance = float(w @ cov @ w)
-        if strategy == "max_sharpe":
-            return -(w @ mu - rf) / np.sqrt(max(variance, 1e-18))
-        return variance
+        return -(w @ mu - rf) / np.sqrt(max(variance, 1e-18)) if strategy == "max_sharpe" else variance
+
+    excess = mu - rf
+    if strategy == "max_sharpe" and excess.max() <= 0 and max_weight == 1:
+        choices = [w for w in np.eye(n) if valid(w)]
+        if not choices:
+            raise BacktestError("No positive-variance feasible allocation")
+        return min(choices, key=objective), "Nonpositive excess returns: exact single-asset comparison"
+
+    options = {"maxiter": 1000, "ftol": 1e-12}
+    if strategy == "max_sharpe" and high @ excess > 1e-12:
+        # y = w / (excess @ w); enforce excess @ y = 1.
+        scale = max(float(np.max(np.abs(excess))), 1e-8)
+        e = excess / scale
+        solution = minimize(lambda y: float(y @ cov @ y), high / (high @ e),
+            jac=lambda y: 2 * cov @ y, method="SLSQP", bounds=[(0, None)] * n,
+            constraints=[{"type": "eq", "fun": lambda y: y @ e - 1, "jac": lambda y: e},
+                         {"type": "ineq", "fun": lambda y: max_weight * y.sum() - y,
+                          "jac": lambda y: max_weight * np.ones((n, n)) - np.eye(n)}], options=options)
+        y = solution.x
+        w = y / y.sum() if y.sum() > 0 else np.full(n, np.nan)
+        if not solution.success or not valid(w) or abs(y @ e - 1) > 1e-6:
+            raise BacktestError(f"max_sharpe: invalid optimizer result ({solution.message})")
+        if any(valid(v) and objective(v) < objective(w) - 1e-7 for v in starts):
+            raise BacktestError("max_sharpe: solution is inferior to a feasible comparison allocation")
+        return w, "Positive-excess Sharpe: convex formulation; comparison checks passed"
+
     constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1}]
     if strategy == "target_return" and np.ptp(mu) > 1e-10:
         constraints.append({"type": "eq", "fun": lambda w: w @ mu - target})
-    result = minimize(objective, eq, method="SLSQP", bounds=[(0, 1)] * n,
-                      constraints=constraints, options={"maxiter": 1000, "ftol": 1e-10})
-    w = result.x
-    valid = (result.success and np.isfinite(w).all() and abs(w.sum() - 1) < 1e-6
-             and w.min() >= -1e-7 and w.max() <= 1 + 1e-7)
-    if strategy == "target_return":
-        valid = valid and abs(w @ mu - target) < 1e-6
-    if not valid or w @ cov @ w <= 1e-16:
-        raise BacktestError(f"{strategy}: invalid optimizer result ({result.message})")
-    return w, str(result.message)
+    candidates = []
+    for start in starts if strategy == "max_sharpe" else starts[:1]:
+        solution = minimize(objective, start, method="SLSQP", bounds=[(0, max_weight)] * n,
+                            constraints=constraints, options=options)
+        if solution.success and valid(solution.x):
+            candidates.append(solution.x)
+    if not candidates:
+        raise BacktestError(f"{strategy}: invalid optimizer result ({solution.message})")
+    candidates += [w for w in starts if valid(w)]
+    w = min(candidates, key=objective)
+    return w, ("Nonpositive feasible excess returns: capped multistart, global optimum not certified"
+               if strategy == "max_sharpe" else "Variance minimization; feasibility and comparison checks passed")
 
 
 def execution_dates(index, mode, frequency):
@@ -201,12 +270,12 @@ def execution_dates(index, mode, frequency):
 def realized_metrics(nav, rf_daily):
     rets = nav.pct_change().iloc[1:]
     excess = rets.to_numpy() - np.asarray(rf_daily)
-    std = float(np.std(excess, ddof=1))
+    std = float(np.std(excess, ddof=1)) if len(excess) > 1 else 0.0
     elapsed = (nav.index[-1] - nav.index[0]).days / 365.25
     return {
         "totalReturn": float(nav.iloc[-1] / nav.iloc[0] - 1),
         "cagr": float((nav.iloc[-1] / nav.iloc[0]) ** (1 / elapsed) - 1),
-        "volatility": float(rets.std(ddof=1) * np.sqrt(252)),
+        "volatility": float(rets.std(ddof=1) * np.sqrt(252)) if len(rets) > 1 else None,
         "sharpe": float(np.mean(excess) / std * np.sqrt(252)) if std > 1e-12 else None,
         "maxDrawdown": float((nav / nav.cummax() - 1).min()),
         "finalValue": float(nav.iloc[-1]), "returnObservations": len(rets),
@@ -263,7 +332,7 @@ def run_backtest(req, prices, market, yields):
                             w = np.array([req.userWeights[ticker] for ticker in req.tickers], dtype=float)
                             message = "User-defined buy-and-hold allocation"
                         else:
-                            w, message = solve_weights(strategy, mu, cov, rf, req.targetReturn)
+                            w, message = solve_weights(strategy, mu, cov, rf, req.targetReturn, req.maxWeight)
                     except BacktestError as exc:
                         state.update(status="failed", error=str(exc), failureDate=day.date().isoformat())
                         # Never report a partial run as comparable full-period performance.
@@ -275,6 +344,9 @@ def run_backtest(req, prices, market, yields):
                         "weights": dict(zip(req.tickers, w.tolist())),
                         "preTradeWeights": dict(zip(req.tickers, before.tolist())),
                         "turnover": turnover, "solverMessage": message,
+                        "estimatedSharpe": float((w @ mu - rf) / np.sqrt(w @ cov @ w)) if w @ cov @ w > 1e-16 else None,
+                        "nonpositiveExcessReturns": bool(np.max(mu - rf) <= 0),
+                        "weightCap": req.maxWeight if strategy != "user_holdings" else None,
                         "expectedReturn": float(w @ mu), "expectedVolatility": float(np.sqrt(w @ cov @ w)),
                         "targetReturn": (float(mu.mean()) if req.targetReturn is None else req.targetReturn) if strategy == "target_return" else None})
             state["nav"].append(value)
@@ -289,21 +361,96 @@ def run_backtest(req, prices, market, yields):
             continue
         nav = pd.Series(state["nav"], index=test.index)
         metrics = realized_metrics(nav, rf_daily)
+        metrics["maxStockWeight"] = float(np.max(state["weights"]))
+        metrics["maxTargetWeight"] = max(max(b["weights"].values()) for b in state["rebalances"])
         metrics.update(turnover=state["turnover"], transactionCosts=0., rebalanceCount=len(state["rebalances"]))
         output[strategy] = {"status": "ok", "metrics": metrics, "nav": state["nav"],
+            "annualMetrics": annual_metrics(nav, rf_daily),
             "drawdown": (nav / nav.cummax() - 1).tolist(), "weights": state["weights"], "rebalances": state["rebalances"]}
     # Hash only the data available within the requested run, not injected future rows.
     benchmark = BACKTEST_MARKETS[req.market]["benchmark"]
     snapshot = pd.concat([prices.loc[:str(req.endDate)], market.loc[:str(req.endDate)].rename(benchmark),
                           yields.loc[:str(req.endDate)].rename("rf")], axis=1)
     return {"config": req.model_dump(mode="json"), "dates": dates, "strategies": output,
+        "marketInfo": {**BACKTEST_MARKETS[req.market], "cashBaseline": "lagged ^TNX yield proxy" if req.market == "US" else "0% local cash assumption"},
+        "riskFreeDaily": rf_daily,
+        "riskFreeDates": dates[1:],
         "dataSha256": hashlib.sha256(snapshot.to_csv().encode()).hexdigest(),
         "assumptions": ["Zero transaction costs; long-only, fully invested, fractional holdings.",
             "Adjusted-close total-return approximation with dividend reinvestment; no separate dividend credits.",
             ("Sharpe uses historical US 10-year Treasury yields." if req.market == "US"
              else "Sharpe uses a 0% local cash baseline; historical local sovereign yields are not yet configured."),
             "Execute at first market close in each calendar period; use only prices before execution day.",
-            "S&P 500 price index (^GSPC) market proxy excludes dividends; annual market estimate = mean daily return × 252.",
-            "Sharpe uses lagged ^TNX annual yields converted by (1 + yield)^(1/252) - 1; this is a cash-rate proxy, not a realized Treasury return.",
-            "Fixed user-selected US/USD universe; survivorship bias and historical data revisions are not eliminated.",
+            f"CAPM benchmark: {benchmark}; price-index returns exclude dividends; annual estimate = mean daily return × 252.",
+            ("Lagged ^TNX yields converted by (1 + yield)^(1/252) - 1; a cash-rate proxy, not a realized Treasury return." if req.market == "US" else "Local sovereign yields are unavailable: 0% is an explicit assumption, not an observed risk-free rate."),
+            f"Fixed {req.market} universe valued in {BACKTEST_MARKETS[req.market]['currency']}; survivorship bias and data revisions remain.",
+            "Weight caps apply at executions to optimized portfolios; weights may drift above the cap. User holdings are uncapped buy-and-hold.",
             "Failed strategies have no full-period performance metrics. Turnover excludes initial investment."]}
+
+
+def annual_metrics(nav, rf_daily):
+    """Yearly returns include the prior year's last close; flag partial years."""
+    out = []
+    for year in sorted(set(nav.index[1:].year)):
+        positions = np.flatnonzero(nav.index[1:].year == year) + 1
+        a, b = int(positions[0]), int(positions[-1])
+        part = nav.iloc[a - 1:b + 1]
+        m = realized_metrics(part, np.asarray(rf_daily)[a - 1:b])
+        out.append({"year": int(year), "startDate": str(part.index[0].date()),
+                    "endDate": str(part.index[-1].date()),
+                    "partialYear": bool(part.index[0].year == year or (b == len(nav) - 1 and (nav.index[-1].month < 12 or nav.index[-1].day < 28))),
+                    **m})
+    return out
+
+
+class ComparisonRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base: BacktestRequest
+    lookbacks: list[int] = Field(default_factory=lambda: [90, 365, 1826], min_length=1, max_length=3)
+    frequencies: list[Literal["monthly", "quarterly"]] = Field(default_factory=lambda: ["monthly", "quarterly"], min_length=1, max_length=2)
+    cappedWeight: float = Field(default=0.6, gt=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_grid(self):
+        if len(set(self.lookbacks)) != len(self.lookbacks) or any(x < 30 or x > 7305 for x in self.lookbacks):
+            raise ValueError("Use distinct lookbacks between 30 and 7305 days")
+        if len(set(self.frequencies)) != len(self.frequencies):
+            raise ValueError("Use distinct frequencies")
+        if self.cappedWeight * len(self.base.tickers) < 1 - 1e-10:
+            raise ValueError("Comparison weight cap is infeasible for this universe")
+        return self
+
+
+def comparison_base(req, lookback, frequency, cap):
+    values = req.base.model_dump()
+    values.update(mode="rolling", estimationStart=None, estimationEnd=None,
+                  lookbackDays=lookback, frequency=frequency, maxWeight=cap)
+    return BacktestRequest(**values)
+
+
+def run_comparison(req, prices, market, yields):
+    """One shared snapshot and evaluation dates for all original/capped runs."""
+    rows, runs = [], []
+    for lookback in req.lookbacks:
+        for frequency in req.frequencies:
+            for variant, cap in [("original", 1.0), ("capped", req.cappedWeight)]:
+                cfg = comparison_base(req, lookback, frequency, cap)
+                entry = {"lookbackDays": lookback, "frequency": frequency, "variant": variant, "maxWeight": cap}
+                try:
+                    result = run_backtest(cfg, prices, market, yields)
+                except BacktestError as exc:
+                    runs.append({**entry, "status": "failed", "error": str(exc)})
+                    continue
+                runs.append({**entry, "status": "ok", "result": result})
+                baseline = result["strategies"]["equal_weight"]
+                for key, strategy in result["strategies"].items():
+                    row = {**entry, "strategy": key, "status": strategy["status"]}
+                    if strategy["status"] == "ok":
+                        m, bm = strategy["metrics"], baseline["metrics"]
+                        delta = None if m["sharpe"] is None or bm["sharpe"] is None else m["sharpe"] - bm["sharpe"]
+                        row.update(metrics=m, sharpeDifference=delta, annualMetrics=strategy["annualMetrics"])
+                    else:
+                        row.update(error=strategy["error"], failureDate=strategy["failureDate"])
+                    rows.append(row)
+    return {"request": req.model_dump(mode="json"), "rows": rows, "runs": runs,
+            "note": "Exploratory comparisons, not an untouched test. Equal weight is rebalanced at the same frequency. Costs are zero."}
