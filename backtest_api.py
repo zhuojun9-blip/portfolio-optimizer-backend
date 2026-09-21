@@ -8,7 +8,7 @@ import yfinance as yf
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from backtest import BACKTEST_MARKETS, BacktestError, BacktestRequest, prepare_data, run_backtest
+from backtest import BACKTEST_MARKETS, BacktestError, BacktestRequest, prepare_data, run_backtest, ComparisonRequest, comparison_base, run_comparison
 
 router = APIRouter()
 
@@ -91,3 +91,16 @@ def backtest_endpoint(req: BacktestRequest):
 @router.get("/backtest", include_in_schema=False)
 def dashboard():
     return FileResponse(Path(__file__).parent / "static" / "backtest.html")
+
+
+@router.post("/api/backtest/compare")
+def comparison_endpoint(req: ComparisonRequest):
+    # Download once over the longest window so each run sees the same prices.
+    data_req = comparison_base(req, max(req.lookbacks), req.frequencies[0], 1.0)
+    try:
+        data = download_data(data_req)
+        return run_comparison(req, *data)
+    except BacktestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DataProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc

@@ -120,3 +120,53 @@ npm test --prefix ui-tests
 These test mode switching, payloads, chart/table rendering, weight selection,
 failed strategy display, and stale-result removal after errors. They are DOM
 unit tests, not a claim of visual verification in every browser.
+
+## Research comparisons and chart inspection
+
+The dashboard now supports selecting a curve directly or through its legend.
+Selection highlights the same strategy on the value and drawdown charts; legend
+checkboxes independently hide series. Pointer movement inspects the nearest
+valuation date and shows all visible values (including overlapping curves).
+Keyboard users can focus a curve, press Enter to select it and use the arrow,
+Home and End keys to inspect dates. “Show all / clear selection” resets the view.
+
+`maxWeight` defaults to 1.0 and bounds each optimized allocation at an execution.
+The request rejects caps below 1 / number of stocks. The bound does not force
+trades between scheduled executions; actual weights can drift above it. The
+optional user-defined portfolio remains an uncapped buy-and-hold benchmark.
+
+`POST /api/backtest/compare` accepts `{base: <BacktestRequest>, cappedWeight: 0.6}`.
+Defaults are lookbacks `[90,365,1826]` and frequencies `["monthly","quarterly"]`.
+Each setting runs original (100% maximum weight) and capped versions. The base
+mode, explicit estimation range and base cap are overridden for this rolling
+comparison; stocks, dates, capital, market, user holdings and target are retained.
+The endpoint downloads the longest history once, requires complete histories,
+and uses the same snapshot for all runs. It returns full runs, summary rows,
+Sharpe differences versus equal weight at the same frequency, yearly metrics,
+and explicit run/strategy failures. Smaller grids are supported, up to 12 runs.
+The UI provides the fixed six-setting grid to discourage unbounded searches.
+
+Yearly returns include the prior year's last available close when present.
+First/last incomplete calendar years are marked partial (end-of-year coverage
+uses December 28 or later to allow weekend/holiday endings). Within-year
+maximum drawdown resets at the start of that yearly slice. This is exploratory
+analysis and does not substitute for an untouched chronological test period.
+
+### Validation and reproducibility
+
+Positive-excess maximum Sharpe is solved through scaled weights and a convex
+variance objective. Uncapped nonpositive-excess cases compare simplex vertices
+exactly, correcting the stationary equal-weight solution that SLSQP could accept.
+Capped nonpositive cases use deterministic multistart and feasible comparisons;
+these are labeled **not globally certified**. No minimum-variance fallback is
+silently substituted. Target feasibility includes the weight cap.
+
+Exports include benchmark/currency/cash assumptions, per-rebalance expected
+returns and covariance with ticker order, estimated Sharpe and solver messages.
+`riskFreeDaily[i]` is aligned with `dates[i+1]` / `riskFreeDates[i]`, allowing
+independent reproduction of realized Sharpe. US cash uses lagged ^TNX yields;
+other markets explicitly use an assumed zero local cash rate, not a historical
+sovereign yield. Currency is local; there is no FX conversion. The benchmark is
+^GSPC (US), ^HSI (HK), 000001.SS (Shanghai), or 399001.SZ (Shenzhen).
+
+Run `python -m unittest discover -p 'test*.py'` and, in `ui-tests`, `npm ci && npm test`.
