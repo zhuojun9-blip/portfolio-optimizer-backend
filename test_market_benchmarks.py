@@ -31,7 +31,7 @@ class MarketBenchmarkTests(unittest.TestCase):
             historyDays=90,
             asOfDate="2021-01-01",
         )
-        with patch.object(api.yf, "Ticker", side_effect=self.fake_ticker(calls)), patch.object(
+        with patch.object(api, "utc_today", return_value=api.date(2021, 1, 1)), patch.object(api.yf, "Ticker", side_effect=self.fake_ticker(calls)), patch.object(
             api, "latest_local_government_yield", return_value=0.03
         ) as rate_lookup:
             result = api.optimize(request)
@@ -51,7 +51,7 @@ class MarketBenchmarkTests(unittest.TestCase):
             historyDays=90,
             asOfDate="2021-01-01",
         )
-        with patch.object(api.yf, "Ticker", side_effect=self.fake_ticker(calls)):
+        with patch.object(api, "utc_today", return_value=api.date(2021, 1, 1)), patch.object(api.yf, "Ticker", side_effect=self.fake_ticker(calls)):
             with self.assertRaises(HTTPException) as context:
                 api.optimize(request)
 

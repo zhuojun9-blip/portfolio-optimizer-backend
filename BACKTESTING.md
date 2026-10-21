@@ -154,12 +154,21 @@ analysis and does not substitute for an untouched chronological test period.
 
 ### Validation and reproducibility
 
-Positive-excess maximum Sharpe is solved through scaled weights and a convex
-variance objective. Uncapped nonpositive-excess cases compare simplex vertices
-exactly, correcting the stationary equal-weight solution that SLSQP could accept.
-Capped nonpositive cases use deterministic multistart and feasible comparisons;
-these are labeled **not globally certified**. No minimum-variance fallback is
-silently substituted. Target feasibility includes the weight cap.
+Maximum Sharpe requires a feasible portfolio with model-estimated excess return
+above 1e-12 (annual decimal units). Feasibility includes weight caps; an individual
+stock beating the risk-free rate is insufficient if its weight is capped.
+Otherwise that strategy stops with an explicit error and failure date, no full-period
+metrics, and no substituted cash or minimum-variance allocation. Other strategies
+continue. The main optimizer uses the same policy, including its short-sale bounds.
+
+Positive-excess maximum Sharpe uses scaled weights and a convex variance
+objective. Zero-variance solutions have undefined Sharpe and are rejected for this
+objective; zero variance is valid for minimum variance and target return.
+The main API represents undefined portfolio Sharpe as JSON null.
+Target feasibility includes the weight cap. Solver weights are validated rather
+than repaired by clipping or normalization. Missing targets in the main
+optimizer are errors; the backtest's documented equal-weight target default remains.
+
 
 Exports include benchmark/currency/cash assumptions, per-rebalance expected
 returns and covariance with ticker order, estimated Sharpe and solver messages.
@@ -170,3 +179,8 @@ sovereign yield. Currency is local; there is no FX conversion. The benchmark is
 ^GSPC (US), ^HSI (HK), 000001.SS (Shanghai), or 399001.SZ (Shenzhen).
 
 Run `python -m unittest discover -p 'test*.py'` and, in `ui-tests`, `npm ci && npm test`.
+
+The main optimizer rejects historical non-US windows when only today's local
+government yield is available, rather than introducing future rate information.
+Current non-US optimization retains the existing local-rate lookup. This is
+separate from the backtest's explicitly disclosed 0% non-US cash assumption.
