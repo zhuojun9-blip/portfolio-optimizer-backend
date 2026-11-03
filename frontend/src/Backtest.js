@@ -7,7 +7,7 @@ const dashboardURL = API.replace(/\/api\/optimize\/?$/, "/backtest");
 export default function Backtest() {
   return (
     <section aria-label="Portfolio backtesting">
-      <p className="backtest-note">
+      <p style={{ padding: "0 16px", color: "#617584", fontSize: 14 }}>
         Historical, out-of-sample comparisons with zero transaction costs. The backend may take a moment to wake up. {" "}
         <a href={dashboardURL} target="_blank" rel="noopener noreferrer">
           Open dashboard in a separate tab

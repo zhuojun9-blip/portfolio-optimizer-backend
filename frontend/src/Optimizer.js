@@ -1,6 +1,14 @@
 // Optimizer.js
 import React, { useState } from "react";
 import axios from "axios";
+import {
+  PieChart,
+  Pie,
+  Cell,
+  Tooltip,
+  Legend,
+} from "recharts";
+
 const API =
   process.env.REACT_APP_API_URL || "http://localhost:8000/api/optimize";
 const TODAY = new Date().toISOString().slice(0, 10);
@@ -14,11 +22,27 @@ const MARKETS = [
   { value: "UK", label: "United Kingdom", suffix: ".L" },
   { value: "IN", label: "India", suffix: ".NS" },
 ];
-function Field({ label, children }) {
-  return <label className="field"><span>{label}</span>{children}</label>;
+const COLORS = [
+  "#2563eb",
+  "#10b981",
+  "#f59e0b",
+  "#ef4444",
+  "#8b5cf6",
+  "#14b8a6",
+  "#f43f5e",
+  "#22c55e",
+  "#eab308",
+  "#0ea5e9",
+];
+
+function Section({ title, children }) {
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardTitle}>{title}</div>
+      {children}
+    </div>
+  );
 }
-const percent = value => Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : "—";
-const decimal = value => Number.isFinite(value) ? value.toFixed(3) : "—";
 
 function getOptimizationError(error) {
   const detail = error.response?.data?.detail;
@@ -163,64 +187,410 @@ export default function Optimizer() {
     }
   };
 
-  const allocations = res ? Object.entries(res.weights || {}) : [];
-  const strategyName = {max_sharpe: "Max Sharpe", min_variance: "Min variance", target_return: "Target return"}[mode];
+  const pieData = res
+    ? Object.entries(res.weights || {}).map(([name, value]) => ({
+        name,
+        value,
+      }))
+    : [];
+
   return (
-    <div className="workspace">
-      <header className="page-heading">
-        <div><p className="eyebrow">CAPM · Mean–variance</p><h1>Build your allocation</h1>
-        <p>Estimate portfolio weights, then compare the model with equal weight.</p></div>
-        <span className="context-note">Model estimates · Annualized</span>
+    <div style={styles.page}>
+      <header style={styles.header}>
+        <h1 style={{ margin: 0 }}>Portfolio Optimizer</h1>
+        <div style={{ color: "#6b7280" }}>
+          CAPM + Mean-Variance (Max Sharpe / Min Variance / Target Return)
+        </div>
       </header>
-      <main className="optimizer-layout">
-        <section className="panel settings-panel" aria-labelledby="settings-title">
-          <h2 id="settings-title">Portfolio settings</h2>
-          <div className="form-stack">
-            <Field label="Portfolio market"><select value={market} onChange={e => changeMarket(e.target.value)}>
-              {MARKETS.map(({value,label}) => <option key={value} value={value}>{label}</option>)}
-            </select></Field>
-            <div><label className="field" htmlFor="ticker-entry"><span>Add ticker</span></label>
-              <div className="ticker-entry"><input id="ticker-entry" value={newTicker} onChange={e => setNewTicker(e.target.value)} onKeyDown={e => {if(e.key === "Enter") {e.preventDefault();addTicker();}}} placeholder={market === "HK" ? "e.g., 700" : "e.g., AMZN"}/><button className="secondary" onClick={addTicker}>Add</button></div>
+
+      <main style={styles.main}>
+        {/* Left: Inputs */}
+        <Section title="Inputs">
+          <div style={{ display: "grid", gap: 12 }}>
+            {/* Ticker entry */}
+            <div>
+              <div style={styles.label}>Portfolio market</div>
+              <select
+                value={market}
+                onChange={(e) => changeMarket(e.target.value)}
+                style={styles.input}
+              >
+                {MARKETS.map(({ value, label }) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
             </div>
-            <div><p className="field-label">Selected tickers <span className="muted">({tickers.length})</span></p>
-              <div className="ticker-list">{tickers.map(t => <span className="ticker-tag" key={t}>{t}<button onClick={() => removeTicker(t)} aria-label={`Remove ${t}`}>×</button></span>)}</div>
-              {!tickers.length && <p className="help">Add a ticker from your selected market.</p>}
+            <div>
+              <div style={styles.label}>Add ticker</div>
+              <div style={styles.tickerEntry}>
+                <input
+                  value={newTicker}
+                  onChange={(e) => setNewTicker(e.target.value)}
+                  placeholder={market === "HK" ? "e.g., 700" : "e.g., AMZN"}
+                  style={styles.input}
+                />
+                <button onClick={addTicker} style={styles.primaryBtn}>
+                  Add
+                </button>
+              </div>
             </div>
-            <div className="form-divider"/>
-            <Field label="Optimization objective"><select value={mode} onChange={e => setMode(e.target.value)}><option value="max_sharpe">Max Sharpe</option><option value="min_variance">Min variance</option><option value="target_return">Target return</option></select></Field>
-            <Field label="Target return (decimal)"><input type="number" step="0.01" disabled={mode !== "target_return"} value={targetReturn} onChange={e => setTargetReturn(e.target.value)}/><small className="help">0.12 means 12% annually. Used for Target return.</small></Field>
-            <div className="form-divider"/>
-            <div><p className="field-label">Estimation window</p><div className="segmented" aria-label="Historical window">
-              <button aria-pressed={windowMode === "date_range"} onClick={() => setWindowMode("date_range")}>Date range</button>
-              <button aria-pressed={windowMode === "lookback"} onClick={() => setWindowMode("lookback")}>Lookback</button>
-            </div></div>
-            <div className="field-pair">
-              {windowMode === "date_range" ? <Field label="Begin date"><input type="date" value={startDate} max={endDate || TODAY} onChange={e => setStartDate(e.target.value)}/></Field> : <Field label="Lookback days"><input type="number" min={1} value={historyDays} onChange={e => setHistoryDays(e.target.value)}/></Field>}
-              <Field label="End date"><input type="date" value={endDate} min={windowMode === "date_range" ? startDate : undefined} max={TODAY} onChange={e => setEndDate(e.target.value)}/></Field>
+
+            {/* Current tickers */}
+            <div>
+              <div style={styles.label}>Selected tickers</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {tickers.map((t) => (
+                  <span key={t} style={styles.chip}>
+                    {t}
+                    <button
+                      onClick={() => removeTicker(t)}
+                      style={styles.chipX}
+                      title="Remove"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
             </div>
-            <button className="primary run-button" onClick={runOptimize} disabled={loading}>{loading ? "Optimizing…" : "Run optimizer"}</button>
-            {err && <div className="error-message" role="alert">{err}</div>}
+
+            {/* Mode + target */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div>
+                <div style={styles.label}>Mode</div>
+                <select
+                  value={mode}
+                  onChange={(e) => setMode(e.target.value)}
+                  style={styles.input}
+                >
+                  <option value="max_sharpe">Max Sharpe</option>
+                  <option value="min_variance">Min Variance</option>
+                  <option value="target_return">Target Return</option>
+                </select>
+              </div>
+              <div>
+                <div style={styles.label}>Target Return (decimal)</div>
+                <input
+                  type="number"
+                  step="0.01"
+                  disabled={mode !== "target_return"}
+                  value={targetReturn}
+                  onChange={(e) => setTargetReturn(e.target.value)}
+                  style={{ ...styles.input, opacity: mode === "target_return" ? 1 : 0.6 }}
+                />
+              </div>
+            </div>
+
+            {/* Historical window */}
+            <div>
+              <div style={styles.label}>Historical window</div>
+              <div style={styles.segmentedControl}>
+                <button
+                  type="button"
+                  onClick={() => setWindowMode("date_range")}
+                  style={{ ...styles.segmentButton, ...(windowMode === "date_range" ? styles.segmentButtonActive : {}) }}
+                >
+                  Date range
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setWindowMode("lookback")}
+                  style={{ ...styles.segmentButton, ...(windowMode === "lookback" ? styles.segmentButtonActive : {}) }}
+                >
+                  Lookback
+                </button>
+              </div>
+            </div>
+
+            {windowMode === "date_range" ? (
+              <div style={styles.formGrid}>
+                <div>
+                  <div style={styles.label}>Begin date</div>
+                  <input
+                    type="date"
+                    value={startDate}
+                    max={endDate || TODAY}
+                    onChange={(e) => setStartDate(e.target.value)}
+                    style={styles.input}
+                  />
+                </div>
+                <div>
+                  <div style={styles.label}>End date</div>
+                  <input
+                    type="date"
+                    value={endDate}
+                    min={startDate}
+                    max={TODAY}
+                    onChange={(e) => setEndDate(e.target.value)}
+                    style={styles.input}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div style={styles.formGrid}>
+                <div>
+                  <div style={styles.label}>Lookback (calendar days)</div>
+                  <input
+                    type="number"
+                    min={1}
+                    value={historyDays}
+                    onChange={(e) => setHistoryDays(e.target.value)}
+                    style={styles.input}
+                  />
+                </div>
+                <div>
+                  <div style={styles.label}>End date</div>
+                  <input
+                    type="date"
+                    value={endDate}
+                    max={TODAY}
+                    onChange={(e) => setEndDate(e.target.value)}
+                    style={styles.input}
+                  />
+                </div>
+              </div>
+            )}
+
+            <button onClick={runOptimize} style={styles.primaryBtn} disabled={loading}>
+              {loading ? "Optimizing..." : "Run Optimizer"}
+            </button>
+
+            {err && <div style={styles.error}>{err}</div>}
           </div>
-        </section>
-        <div className="result-stack" aria-busy={loading} aria-live="polite">
-          <section className="panel allocation-panel" aria-labelledby="allocation-title">
-            <div className="panel-heading"><h2 id="allocation-title">Allocation weights</h2><span className="muted">{res ? `${allocations.length} assets` : "Awaiting calculation"}</span></div>
-            {res && allocations.length ? <>
-              <div className="allocation-bars" aria-label="Portfolio weights">{allocations.map(([ticker,weight]) => <div className="allocation-row" key={ticker}><span className="ticker-name">{ticker}</span><div className="bar-track"><div className="bar-fill" style={{width:`${Math.max(0, Math.min(100, weight*100))}%`}}/></div><span className="number">{percent(weight)}</span></div>)}</div>
-              <div className="table-scroll"><table><caption className="sr-only">Stock allocation and model estimates</caption><thead><tr><th scope="col">Ticker</th><th scope="col">Weight</th><th scope="col">Beta</th><th scope="col">CAPM return</th><th scope="col">CAGR (approx.)</th></tr></thead><tbody>{res.usedTickers.map(t => {const info=res.perStock?.[t] || {};return <tr key={t}><th scope="row">{t}</th><td>{percent(res.weights[t] ?? 0)}</td><td>{decimal(info.beta)}</td><td>{percent(info.expectedCAPM)}</td><td>{percent(info.cagrApprox)}</td></tr>})}</tbody></table></div>
-            </> : <div className="allocation-empty"><div className="empty-mark" aria-hidden="true">β</div><h3>{loading ? "Estimating your allocation" : "Your allocation starts here"}</h3><p>{loading ? "Loading prices and solving the allocation. The API may take a moment to wake up." : "Choose your stocks, objective and estimation window. Run the optimizer to see weights and compare model estimates."}</p><span className="empty-context">{tickers.length} selected assets · {strategyName}</span></div>}
-          </section>
-          <section className="panel" aria-labelledby="stats-title"><div className="panel-heading"><h2 id="stats-title">Portfolio estimates</h2><span className="muted">Annualized</span></div>
-            {res ? <div className="table-scroll"><table className="estimate-table"><thead><tr><th scope="col">Metric</th><th scope="col">Optimized</th><th scope="col">Equal weight</th></tr></thead><tbody>
-              <tr><th scope="row">Expected return</th><td>{percent(res.stats.expected_return)}</td><td>{percent(res.baseline.expected_return)}</td></tr>
-              <tr><th scope="row">Volatility</th><td>{percent(res.stats.volatility)}</td><td>{percent(res.baseline.volatility)}</td></tr>
-              <tr><th scope="row">Sharpe ratio</th><td>{decimal(Number(res.stats.sharpe))}</td><td>{decimal(Number(res.baseline.sharpe))}</td></tr>
-            </tbody></table></div> : <p className="muted">Expected return, volatility and Sharpe will appear beside the equal-weight baseline.</p>}
-            <p className="help method-note">Model estimates are not realized performance. Use Backtest to evaluate subsequent historical returns.</p>
-          </section>
-          <section className="panel market-panel"><h2>Market snapshot</h2>{res ? <div className="market-values"><div><span>Benchmark return</span><strong className="number">{percent(res.market.Rm)}</strong></div><div><span>Risk-free rate</span><strong className="number">{percent(res.market.Rf)}</strong></div></div> : <p className="muted">Benchmark return and risk-free rate appear after calculation.</p>}</section>
+        </Section>
+
+        {/* Right: Results */}
+        <div style={{ display: "grid", gap: 16 }}>
+          <Section title="Weights">
+            {res && pieData.length > 0 ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 16 }}>
+                {/* Table */}
+                <div style={{ overflowX: "auto" }}>
+                  <table style={styles.table}>
+                    <thead>
+                      <tr>
+                        <th>Ticker</th>
+                        <th>Weight</th>
+                        <th>β</th>
+                        <th>CAPM Exp.</th>
+                        <th>CAGR (approx)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {res.usedTickers.map((t) => {
+                        const w = res.weights[t] ?? 0;
+                        const info = (res.perStock && res.perStock[t]) || {};
+                        const beta = info.beta;
+                        const capm = info.expectedCAPM;
+                        const cagr = info.cagrApprox;
+                        return (
+                          <tr key={t}>
+                            <td>{t}</td>
+                            <td>{(w * 100).toFixed(2)}%</td>
+                            <td>{Number.isFinite(beta) ? beta.toFixed(3) : "—"}</td>
+                            <td>{Number.isFinite(capm) ? (capm * 100).toFixed(2) + "%" : "—"}</td>
+                            <td>{Number.isFinite(cagr) ? (cagr * 100).toFixed(2) + "%" : "—"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Pie */}
+                <div style={{ width: 320, height: 260 }}>
+                  <PieChart width={320} height={260}>
+                    <Pie
+                      data={pieData}
+                      dataKey="value"
+                      nameKey="name"
+                      innerRadius={60}
+                      outerRadius={100}
+                      paddingAngle={2}
+                    >
+                      {pieData.map((_, i) => (
+                        <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip formatter={(v) => (v * 100).toFixed(2) + "%"} />
+                    <Legend />
+                  </PieChart>
+                </div>
+              </div>
+            ) : (
+              <div style={{ color: "#6b7280" }}>No results yet.</div>
+            )}
+          </Section>
+
+          <Section title="Portfolio Stats (annualized)">
+            {res ? (
+              <div style={{ display: "grid", gap: 8 }}>
+                <div style={styles.kv}>
+                  <div>Expected Return</div>
+                  <div>{(res.stats.expected_return * 100).toFixed(2)}%</div>
+                </div>
+                <div style={styles.kv}>
+                  <div>Volatility</div>
+                  <div>{(res.stats.volatility * 100).toFixed(2)}%</div>
+                </div>
+                <div style={styles.kv}>
+                  <div>Sharpe (Rf {(res.market.Rf * 100).toFixed(2)}%)</div>
+                  <div>{Number(res.stats.sharpe).toFixed(3)}</div>
+                </div>
+
+                <hr style={{ border: "none", borderTop: "1px solid #e5e7eb" }} />
+
+                <div style={{ color: "#6b7280" }}>Equal-Weight Baseline</div>
+                <div style={styles.kv}>
+                  <div>Expected Return</div>
+                  <div>{(res.baseline.expected_return * 100).toFixed(2)}%</div>
+                </div>
+                <div style={styles.kv}>
+                  <div>Volatility</div>
+                  <div>{(res.baseline.volatility * 100).toFixed(2)}%</div>
+                </div>
+                <div style={styles.kv}>
+                  <div>Sharpe</div>
+                  <div>{Number(res.baseline.sharpe).toFixed(3)}</div>
+                </div>
+              </div>
+            ) : (
+              <div style={{ color: "#6b7280" }}>No stats yet.</div>
+            )}
+          </Section>
+
+          <Section title="Market Snapshot">
+            {res ? (
+              <div style={{ display: "flex", gap: 24 }}>
+                <div>Benchmark return: {(res.market.Rm * 100).toFixed(2)}%</div>
+                <div>Risk-free rate: {(res.market.Rf * 100).toFixed(2)}%</div>
+              </div>
+            ) : (
+              <div style={{ color: "#6b7280" }}>—</div>
+            )}
+          </Section>
         </div>
       </main>
     </div>
   );
 }
+
+// ---------- simple styles ----------
+const styles = {
+  page: {
+    minHeight: "100vh",
+    background: "#f6f7fb",
+    color: "#111827",
+    fontFamily:
+      '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji"',
+  },
+  header: {
+    maxWidth: 1100,
+    margin: "0 auto",
+    padding: "24px 16px",
+  },
+  main: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 360px) minmax(0, 1fr)",
+    gap: 16,
+    maxWidth: 1100,
+    margin: "0 auto",
+    padding: "0 16px 32px",
+  },
+  card: {
+    minWidth: 0,
+    background: "white",
+    border: "1px solid #e5e7eb",
+    borderRadius: 16,
+    padding: 16,
+    boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+  },
+  cardTitle: {
+    fontSize: 13,
+    color: "#6b7280",
+    fontWeight: 600,
+    marginBottom: 8,
+  },
+  label: { fontSize: 12, color: "#6b7280", marginBottom: 6 },
+  formGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 8,
+  },
+  tickerEntry: {
+    display: "flex",
+    gap: 8,
+    minWidth: 0,
+  },
+  input: {
+    width: "100%",
+    minWidth: 0,
+    boxSizing: "border-box",
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid #d1d5db",
+    background: "white",
+  },
+  primaryBtn: {
+    boxSizing: "border-box",
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid #111827",
+    background: "#111827",
+    color: "white",
+    cursor: "pointer",
+  },
+  segmentedControl: {
+    display: "flex",
+    border: "1px solid #d1d5db",
+    borderRadius: 8,
+    overflow: "hidden",
+  },
+  segmentButton: {
+    flex: 1,
+    minWidth: 0,
+    padding: "8px 10px",
+    border: "none",
+    background: "white",
+    color: "#4b5563",
+    cursor: "pointer",
+  },
+  segmentButtonActive: {
+    background: "#111827",
+    color: "white",
+  },
+  chip: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "6px 10px",
+    borderRadius: 999,
+    background: "#e5e7eb",
+    fontSize: 13,
+  },
+  chipX: {
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    color: "#6b7280",
+    fontSize: 16,
+    lineHeight: 1,
+  },
+  table: {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: 14,
+  },
+  kv: {
+    display: "flex",
+    justifyContent: "space-between",
+    padding: "6px 0",
+  },
+  error: {
+    color: "#b91c1c",
+    background: "#fee2e2",
+    border: "1px solid #fecaca",
+    padding: "8px 10px",
+    borderRadius: 10,
+  },
+};

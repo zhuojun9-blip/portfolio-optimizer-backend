@@ -1,8 +1,49 @@
+// App.js
 import React from "react";
-import { BrowserRouter as Router, Routes, Route, NavLink } from "react-router-dom";
+import { BrowserRouter as Router, Routes, Route, Link } from "react-router-dom";
 import Optimizer from "./Optimizer";
 import Definitions from "./Definitions";
 import Backtest from "./Backtest";
+
+const navStyle = {
+  display: "flex",
+  gap: 12,
+  alignItems: "center",
+  padding: 16,
+  borderBottom: "1px solid #e5e7eb",
+  background: "#ffffff",
+};
+
+const linkStyle = {
+  textDecoration: "none",
+  color: "#111827",
+  padding: "8px 12px",
+  borderRadius: 8,
+};
+
 export default function App() {
-  return <Router><header className="app-header"><div className="app-nav-inner"><span className="wordmark">Portfolio Optimizer</span><nav aria-label="Main navigation"><NavLink to="/" end>Optimizer</NavLink><NavLink to="/backtest">Backtest</NavLink><NavLink to="/definitions">Definitions</NavLink></nav><span className="nav-context">Allocation & research</span></div></header><Routes><Route path="/" element={<Optimizer/>}/><Route path="/definitions" element={<Definitions/>}/><Route path="/backtest" element={<Backtest/>}/></Routes></Router>;
+  return (
+    <Router>
+      <div style={navStyle}>
+        <Link to="/" style={linkStyle}>
+          Optimizer
+        </Link>
+        <Link to="/definitions" style={linkStyle}>
+          Definitions
+        </Link>
+        <Link to="/backtest" style={linkStyle}>
+          Backtest
+        </Link>
+        <div style={{ marginLeft: "auto", color: "#6b7280", fontSize: 14 }}>
+          Portfolio Optimizer — CAPM + Mean-Variance
+        </div>
+      </div>
+
+      <Routes>
+        <Route path="/" element={<Optimizer />} />
+        <Route path="/definitions" element={<Definitions />} />
+        <Route path="/backtest" element={<Backtest />} />
+      </Routes>
+    </Router>
+  );
 }
