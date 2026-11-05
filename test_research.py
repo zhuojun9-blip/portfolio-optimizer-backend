@@ -20,9 +20,8 @@ class ResearchTests(unittest.TestCase):
         json.dumps(result, allow_nan=False)
 
     def test_negative_sharpe_stationary_point_is_not_accepted(self):
-        w, _ = bt.solve_weights('max_sharpe', np.array([-.06, -.06]), np.eye(2)*.04, .04)
-        self.assertAlmostEqual((w@np.array([-.06,-.06])-.04)/np.sqrt(w@(.04*np.eye(2))@w), -.5)
-        self.assertAlmostEqual(w.max(), 1)
+        with self.assertRaisesRegex(bt.BacktestError, "No feasible portfolio"):
+            bt.solve_weights('max_sharpe', np.array([-.06, -.06]), np.eye(2)*.04, .04)
 
     def test_positive_sharpe_and_caps_match_dense_independent_grid(self):
         mu=np.array([.08,.16]);cov=np.array([[.03,.01],[.01,.09]])
@@ -34,9 +33,8 @@ class ResearchTests(unittest.TestCase):
             self.assertLessEqual(w.max(),cap+1e-8)
 
     def test_negative_capped_compares_vertices(self):
-        mu=np.array([-.06,-.06]);cov=np.eye(2)*.04
-        w,_=bt.solve_weights('max_sharpe',mu,cov,.04,max_weight=.6)
-        self.assertAlmostEqual(w.max(),.6)
+        with self.assertRaisesRegex(bt.BacktestError, "No feasible portfolio"):
+            bt.solve_weights('max_sharpe', np.array([-.06, -.06]), np.eye(2)*.04, .04, max_weight=.6)
 
     def test_cap_and_target_feasibility(self):
         with self.assertRaises(ValidationError): request(maxWeight=.4)

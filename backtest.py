@@ -168,18 +168,12 @@ def estimate_inputs(prices, market, yields, start, cutoff):
 
 
 def solve_weights(strategy, mu, cov, rf, target=None, max_weight=1.0):
-    """Validate feasible solutions and compare starts; never silently change objectives.
-
-    Positive excess-return Sharpe uses a convex variance minimization in scaled
-    weights. Nonpositive unconstrained Sharpe is maximized at a simplex vertex.
-    With a cap and nonpositive excess returns, use deterministic multistart;
-    this branch is explicitly not a certificate of global optimality.
-    """
+    """Solve the requested objective; reject Sharpe without positive feasible excess."""
     mu, cov = np.asarray(mu, float), np.asarray(cov, float)
     n = len(mu)
     if strategy not in {"max_sharpe", "min_variance", "target_return", "equal_weight"}:
         raise BacktestError("Unknown strategy")
-    if (cov.shape != (n, n) or not np.isfinite(mu).all() or
+    if (mu.ndim != 1 or n == 0 or cov.shape != (n, n) or not np.isfinite(mu).all() or
             not np.isfinite(cov).all() or not np.isfinite(rf) or
             not np.isfinite(max_weight) or not 0 < max_weight <= 1 or n * max_weight < 1 - 1e-10):
         raise BacktestError("Invalid optimization inputs or infeasible weight cap")
@@ -211,7 +205,7 @@ def solve_weights(strategy, mu, cov, rf, target=None, max_weight=1.0):
     def valid(w):
         return (np.isfinite(w).all() and abs(w.sum() - 1) < 1e-7 and
                 w.min() >= -1e-8 and w.max() <= max_weight + 1e-8 and
-                w @ cov @ w > 1e-16 and
+                (strategy != "max_sharpe" or w @ cov @ w > 1e-16) and
                 (strategy != "target_return" or abs(w @ mu - target) < 1e-7))
 
     def objective(w):
@@ -219,11 +213,11 @@ def solve_weights(strategy, mu, cov, rf, target=None, max_weight=1.0):
         return -(w @ mu - rf) / np.sqrt(max(variance, 1e-18)) if strategy == "max_sharpe" else variance
 
     excess = mu - rf
-    if strategy == "max_sharpe" and excess.max() <= 0 and max_weight == 1:
-        choices = [w for w in np.eye(n) if valid(w)]
-        if not choices:
-            raise BacktestError("No positive-variance feasible allocation")
-        return min(choices, key=objective), "Nonpositive excess returns: exact single-asset comparison"
+    if strategy == "max_sharpe" and high @ excess <= 1e-12:
+        raise BacktestError(
+            "No feasible portfolio has positive model-estimated excess return in this window "
+            "(numerical tolerance 1e-12). Maximum Sharpe is unavailable; no fallback was applied."
+        )
 
     options = {"maxiter": 1000, "ftol": 1e-12}
     if strategy == "max_sharpe" and high @ excess > 1e-12:
@@ -247,7 +241,7 @@ def solve_weights(strategy, mu, cov, rf, target=None, max_weight=1.0):
     if strategy == "target_return" and np.ptp(mu) > 1e-10:
         constraints.append({"type": "eq", "fun": lambda w: w @ mu - target})
     candidates = []
-    for start in starts if strategy == "max_sharpe" else starts[:1]:
+    for start in starts[:1]:
         solution = minimize(objective, start, method="SLSQP", bounds=[(0, max_weight)] * n,
                             constraints=constraints, options=options)
         if solution.success and valid(solution.x):
@@ -256,8 +250,7 @@ def solve_weights(strategy, mu, cov, rf, target=None, max_weight=1.0):
         raise BacktestError(f"{strategy}: invalid optimizer result ({solution.message})")
     candidates += [w for w in starts if valid(w)]
     w = min(candidates, key=objective)
-    return w, ("Nonpositive feasible excess returns: capped multistart, global optimum not certified"
-               if strategy == "max_sharpe" else "Variance minimization; feasibility and comparison checks passed")
+    return w, "Variance minimization; feasibility and comparison checks passed"
 
 
 def execution_dates(index, mode, frequency):

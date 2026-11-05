@@ -122,7 +122,7 @@ def portfolio_stats(w: np.ndarray, mu: np.ndarray, Sigma_ann: np.ndarray, rf: fl
     port_ret = float(w @ mu)
     port_var = float(w @ Sigma_ann @ w)
     port_vol = float(np.sqrt(max(port_var, 0.0)))
-    sharpe = (port_ret - rf) / port_vol if port_vol > 0 else float("nan")
+    sharpe = (port_ret - rf) / port_vol if port_vol > 0 else None
     return {"expected_return": port_ret, "volatility": port_vol, "sharpe": sharpe}
 
 def _require_scipy() -> None:
@@ -132,54 +132,93 @@ def _require_scipy() -> None:
             detail="Portfolio optimization is unavailable because SciPy is not installed.",
         )
 
-def _solver_weights(result, strategy: str) -> np.ndarray:
+def _solver_weights(result, strategy: str, mu=None, allow_short=False, target=None) -> np.ndarray:
     if not result.success:
         raise HTTPException(
             status_code=422,
             detail=f"{strategy} optimization failed: {result.message}",
         )
-    return np.asarray(result.x, dtype=float)
+    w = np.asarray(result.x, dtype=float)
+    if mu is not None and (
+        w.shape != mu.shape or not np.isfinite(w).all()
+        or abs(w.sum() - 1) > 1e-7
+        or w.min() < (-1 if allow_short else 0) - 1e-8 or w.max() > 1 + 1e-8
+        or (target is not None and abs(w @ mu - target) > 1e-7)
+    ):
+        raise HTTPException(status_code=422, detail=f"{strategy}: invalid optimizer weights.")
+    return w
+
+def _validated_inputs(mu, cov):
+    mu, cov = np.asarray(mu, float), np.asarray(cov, float)
+    if (mu.ndim != 1 or not mu.size or cov.shape != (mu.size, mu.size)
+            or not np.isfinite(mu).all() or not np.isfinite(cov).all()):
+        raise HTTPException(status_code=422, detail="Invalid optimization inputs.")
+    cov = (cov + cov.T) / 2
+    if np.linalg.eigvalsh(cov).min() < -1e-10:
+        raise HTTPException(status_code=422, detail="Covariance must be positive semidefinite.")
+    return mu, cov
 
 def feasible_target_return_range(mu: np.ndarray, allow_short: bool) -> tuple[float, float]:
-    _require_scipy()
-    n = len(mu)
-    bounds = [(-1, 1) if allow_short else (0, 1) for _ in range(n)]
-    constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
-    lower = minimize(
-        lambda w: w @ mu,
-        np.ones(n) / n,
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
-    )
-    upper = minimize(
-        lambda w: -(w @ mu),
-        np.ones(n) / n,
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
-    )
-    return float(_solver_weights(lower, "Target-return feasibility check") @ mu), float(
-        _solver_weights(upper, "Target-return feasibility check") @ mu
-    )
+    # Linear objectives attain extrema by filling the highest/lowest returns
+    # from the lower bound. This includes the net-investment short constraint.
+    mu = np.asarray(mu, float)
+    if mu.ndim != 1 or not mu.size or not np.isfinite(mu).all():
+        raise HTTPException(status_code=422, detail="Invalid expected returns.")
+    def extreme(order):
+        w = np.full(len(mu), -1.0 if allow_short else 0.0)
+        remaining = 1 - w.sum()
+        for i in order:
+            add = min(1 - w[i], remaining)
+            w[i] += add
+            remaining -= add
+        return float(w @ mu)
+    return extreme(np.argsort(mu)), extreme(np.argsort(-mu))
+
 
 def optimize_max_sharpe(mu: np.ndarray, Sigma_ann: np.ndarray, rf: float, allow_short: bool) -> np.ndarray:
-    n = len(mu)
     _require_scipy()
+    mu, Sigma_ann = _validated_inputs(mu, Sigma_ann)
+    if not np.isfinite(rf):
+        raise HTTPException(status_code=422, detail="Invalid risk-free rate.")
+    from backtest import solve_weights, BacktestError
+    if not allow_short:
+        try:
+            return solve_weights("max_sharpe", mu, Sigma_ann, rf)[0]
+        except BacktestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    maximum = feasible_target_return_range(mu, True)[1]
+    if maximum - rf <= 1e-12:
+        raise HTTPException(status_code=422, detail=(
+            "No feasible portfolio has positive model-estimated excess return in this window "
+            "(numerical tolerance 1e-12). Maximum Sharpe is unavailable; no fallback was applied."))
+    # Convex transformed problem, preserving -1 <= w_i <= 1 and sum(w)=1.
+    e = (mu - rf) / max(float(np.max(np.abs(mu - rf))), 1e-8)
+    n = len(mu)
+    start = np.full(n, -1.)
+    remaining = n + 1.
+    for i in np.argsort(-mu):
+        add = min(2., remaining)
+        start[i] += add
+        remaining -= add
+    res = minimize(lambda y: float(y @ Sigma_ann @ y), start / (start @ e),
+        jac=lambda y: 2 * Sigma_ann @ y, method="SLSQP",
+        constraints=[
+            {"type": "eq", "fun": lambda y: y @ e - 1},
+            {"type": "ineq", "fun": lambda y: y.sum() - y},
+            {"type": "ineq", "fun": lambda y: y.sum() + y},
+        ], options={"maxiter": 1000, "ftol": 1e-12})
+    y = _solver_weights(res, "Maximum-Sharpe")
+    if (not np.isfinite(y).all() or y.sum() <= 0 or abs(y @ e - 1) > 1e-6):
+        raise HTTPException(status_code=422, detail="Maximum-Sharpe: invalid transformed solution.")
+    res.x = y / y.sum()
+    w = _solver_weights(res, "Maximum-Sharpe", mu, True)
+    if w @ Sigma_ann @ w <= 1e-16:
+        raise HTTPException(status_code=422, detail="Maximum-Sharpe requires positive variance.")
+    return w
 
-    def neg_sharpe(w):
-        r = w @ mu
-        v = w @ Sigma_ann @ w
-        vol = np.sqrt(max(v, 1e-18))
-        return - (r - rf) / vol
-
-    w0 = np.ones(n) / n
-    bounds = [(-1, 1) if allow_short else (0, 1) for _ in range(n)]
-    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
-    res = minimize(neg_sharpe, w0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 1000})
-    return _solver_weights(res, "Maximum-Sharpe")
 
 def optimize_min_variance(mu: np.ndarray, Sigma_ann: np.ndarray, allow_short: bool) -> np.ndarray:
+    mu, Sigma_ann = _validated_inputs(mu, Sigma_ann)
     n = len(mu)
     _require_scipy()
 
@@ -189,11 +228,14 @@ def optimize_min_variance(mu: np.ndarray, Sigma_ann: np.ndarray, allow_short: bo
     bounds = [(-1, 1) if allow_short else (0, 1) for _ in range(n)]
     cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
     res = minimize(var_obj, w0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 1000})
-    return _solver_weights(res, "Minimum-variance")
+    return _solver_weights(res, "Minimum-variance", mu, allow_short)
 
 def optimize_target_return(mu: np.ndarray, Sigma_ann: np.ndarray, target_ret: float, allow_short: bool) -> np.ndarray:
+    mu, Sigma_ann = _validated_inputs(mu, Sigma_ann)
     n = len(mu)
     _require_scipy()
+    if not np.isfinite(target_ret):
+        raise HTTPException(status_code=422, detail="Target return must be finite.")
     minimum_return, maximum_return = feasible_target_return_range(mu, allow_short)
     tolerance = 1e-8
     if target_ret < minimum_return - tolerance or target_ret > maximum_return + tolerance:
@@ -213,8 +255,10 @@ def optimize_target_return(mu: np.ndarray, Sigma_ann: np.ndarray, target_ret: fl
         {"type": "eq", "fun": lambda w: np.sum(w) - 1},
         {"type": "eq", "fun": lambda w, mu=mu, t=target_ret: w @ mu - t},
     ]
-    res = minimize(var_obj, w0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 1000})
-    return _solver_weights(res, "Target-return")
+    if np.ptp(mu) <= 1e-12:
+        cons = cons[:1]
+    res = minimize(var_obj, w0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 1000, "ftol": 1e-12})
+    return _solver_weights(res, "Target-return", mu, allow_short, target_ret)
 
 
 # ----------------- request/response models -----------------
@@ -252,8 +296,8 @@ class OptimizeResponse(BaseModel):
     perStock: Dict[str, Dict[str, float]]
     usedTickers: List[str]
     weights: Dict[str, float]
-    stats: Dict[str, float]
-    baseline: Dict[str, float]
+    stats: Dict[str, Optional[float]]
+    baseline: Dict[str, Optional[float]]
 
 
 # ----------------- app + CORS -----------------
@@ -270,6 +314,8 @@ app.add_middleware(
 # ----------------- core endpoint -----------------
 @app.post("/api/optimize", response_model=OptimizeResponse)
 def optimize(req: OptimizeRequest):
+    if req.mode == "target_return" and (req.targetReturn is None or not math.isfinite(req.targetReturn)):
+        raise HTTPException(status_code=422, detail="Target-return mode requires a finite targetReturn.")
     years = req.historyYears
     period = f"{years}y"
 
@@ -302,6 +348,12 @@ def optimize(req: OptimizeRequest):
             rate_start = end - timedelta(days=31)
         except (OverflowError, ValueError):
             raise HTTPException(status_code=422, detail="Requested lookback is outside the supported date range.")
+
+    if req.market != "US" and bounded and end < utc_today():
+        raise HTTPException(status_code=422, detail=(
+            "Historical non-US optimization requires a historical local risk-free rate. "
+            "Only current local yields are available; today's yield cannot be used for this window."
+        ))
 
     def get_close(symbol, label):
         try:
@@ -433,21 +485,7 @@ def optimize(req: OptimizeRequest):
     elif req.mode == "min_variance":
         w = optimize_min_variance(mu, Sigma_ann, allow_short)
     else:
-        t = req.targetReturn if (req.targetReturn is not None) else float("nan")
-        if not (isinstance(t, (int, float)) and math.isfinite(t)):
-            w = optimize_max_sharpe(mu, Sigma_ann, Rf, allow_short)
-        else:
-            w = optimize_target_return(mu, Sigma_ann, t, allow_short)
-
-    # Clean & normalize
-    w = np.array(w, dtype=float)
-    if not allow_short:
-        w = np.maximum(w, 0)
-    s = w.sum()
-    if s == 0:
-        w = np.ones_like(w) / len(w)
-    else:
-        w = w / s
+        w = optimize_target_return(mu, Sigma_ann, req.targetReturn, allow_short)
 
     stats = portfolio_stats(w, mu, Sigma_ann, Rf)
     weq = np.ones_like(w) / len(w)
@@ -458,8 +496,8 @@ def optimize(req: OptimizeRequest):
         perStock=per_stock,
         usedTickers=used_tickers,
         weights={t: float(x) for t, x in zip(used_tickers, w.tolist())},
-        stats={k: float(v) for k, v in stats.items()},
-        baseline={k: float(v) for k, v in stats_eq.items()},
+        stats={k: None if v is None else float(v) for k, v in stats.items()},
+        baseline={k: None if v is None else float(v) for k, v in stats_eq.items()},
     )
 
 # Independent research endpoints preserve the existing optimizer API contract.
